@@ -1,0 +1,303 @@
+{
+  "enabled": {
+    "description": "启用发言检查",
+    "type": "bool",
+    "default": false,
+    "hint": "首次使用先添加群，保留“仅观察”并测试正则；开启后开始读取发言成员资料。关闭停止新增处理，但仍完成已有事项的解禁和撤回核验。"
+  },
+  "groups": {
+    "description": "要管理的群",
+    "type": "template_list",
+    "default": [],
+    "hint": "一个群一条规则。不扫描全群，只检查发言的人。",
+    "templates": {
+      "group": {
+        "name": "添加一个群",
+        "display_item": "group_id",
+        "items": {
+          "group_id": {
+            "description": "QQ群号",
+            "type": "string",
+            "default": ""
+          },
+          "enabled": {
+            "description": "管理这个群",
+            "type": "bool",
+            "default": true,
+            "hint": "关闭仅停止新增提醒和禁言；已有事项继续核验。"
+          },
+          "mode": {
+            "description": "运行方式",
+            "type": "string",
+            "default": "仅观察",
+            "options": [
+              "仅观察",
+              "只提醒",
+              "提醒并禁言"
+            ],
+            "hint": "先观察日志与测试正则，确认后切换。只提醒永不新增禁言；已有禁言仍按归属核验。"
+          },
+          "pattern": {
+            "description": "群名片正则",
+            "type": "string",
+            "default": "(?:大[一二三四五]|研[一二三])-\\S{2,40}",
+            "hint": "对完整群名片匹配，空名片不合格，不使用QQ昵称代替。可私聊 /名片规范 测试 群号 名片。"
+          },
+          "format_help": {
+            "description": "告诉成员应使用的格式",
+            "type": "string",
+            "default": "年级-学校"
+          },
+          "example": {
+            "description": "正确示例",
+            "type": "string",
+            "default": "大三-某某大学"
+          },
+          "protect_level": {
+            "description": "群等级达到多少就豁免",
+            "type": "int",
+            "default": 0,
+            "hint": "0表示不按等级豁免；设为10则≥10豁免，资料不明时暂缓。群主、管理员和机器人自身始终豁免。"
+          },
+          "protect_title": {
+            "description": "豁免有群专属头衔的人",
+            "type": "bool",
+            "default": true
+          },
+          "exempt_users": {
+            "description": "始终豁免的QQ号",
+            "type": "list",
+            "default": [],
+            "hint": "每项一个QQ号；也可以通过私聊命令临时或永久豁免。"
+          },
+          "reminder": {
+            "description": "提醒内容",
+            "type": "text",
+            "default": "请将群名片改为：{格式说明}。例如：{正确示例}。改好后会自动核验并撤回提醒；如有本插件设置的禁言，会一并核验解除。",
+            "hint": "自动在前面@成员。可用：{格式说明}、{正确示例}、{违规轮次}、{禁言分钟}、{群号}、{QQ号}。"
+          },
+          "stage_minutes": {
+            "description": "每轮违规禁言几分钟",
+            "type": "list",
+            "default": [
+              "0",
+              "10",
+              "60",
+              "360"
+            ],
+            "hint": "按第1、2、3…轮排列；0为只提醒，超过项数重复最后一档。每项0～1440分钟，最多8档；仅在“提醒并禁言”生效。到期后必须有新发言才会进入下一轮。"
+          },
+          "first_grace_minutes": {
+            "description": "首次提醒后至少等几分钟才可再次提醒",
+            "type": "int",
+            "default": 10,
+            "hint": "1～1440；与禁言到期时间和提醒间隔取较晚值。"
+          },
+          "reset_days": {
+            "description": "多少天没有新违规轮次就从第一轮重新开始",
+            "type": "int",
+            "default": 7,
+            "hint": "1～365天。改好名片会结束当前事项，但不会立刻清零近期违规轮次。"
+          },
+          "advanced": {
+            "description": "更多设置（通常保留默认）",
+            "type": "object",
+            "hint": "",
+            "items": {
+              "newcomer_minutes": {
+                "description": "入群多久内只提醒，不新增禁言（分钟）",
+                "type": "int",
+                "default": 10,
+                "hint": "0～10080；0关闭新成员保护。"
+              },
+              "repeat_minutes": {
+                "description": "同一个人两次提醒至少间隔几分钟",
+                "type": "int",
+                "default": 5,
+                "hint": "1～1440；连发消息只计一轮。"
+              },
+              "daily_mutes": {
+                "description": "每个人最近24小时最多禁言几次",
+                "type": "int",
+                "default": 3,
+                "hint": "1～10；达到上限，本轮仍可提醒但不会延迟补罚。"
+              },
+              "protect_qq_level": {
+                "description": "QQ等级达到多少就豁免",
+                "type": "int",
+                "default": 0,
+                "hint": "0关闭。群等级和QQ等级不同；开启后QQ等级缺失或为0会暂缓。"
+              },
+              "strip_spaces": {
+                "description": "匹配前忽略名片两端空白",
+                "type": "bool",
+                "default": true
+              },
+              "ignore_case": {
+                "description": "匹配时忽略英文字母大小写",
+                "type": "bool",
+                "default": false
+              },
+              "recall_on_compliance": {
+                "description": "合规或获得豁免后撤回提醒",
+                "type": "bool",
+                "default": true
+              },
+              "unmute_on_compliance": {
+                "description": "合规或获得豁免后解除本插件禁言",
+                "type": "bool",
+                "default": true,
+                "hint": "只解除有归属证据、仍然有效的禁言；管理员中途修改或归属不明交人工。"
+              },
+              "bot_qq": {
+                "description": "负责这个群的机器人QQ（通常留空）",
+                "type": "string",
+                "default": "",
+                "hint": "只接入一个QQ时自动识别。多QQ接入时请填写，每群只由一个QQ负责。"
+              }
+            }
+          },
+          "stage_reminders": {
+            "description": "每轮单独的提醒内容（可不填）",
+            "type": "list",
+            "default": [],
+            "hint": "与禁言阶梯逐项对应。未填写的轮次使用上面的通用提醒，超过阶梯后使用最后一档；支持同样的占位符。"
+          }
+        }
+      }
+    }
+  },
+  "pace": {
+    "description": "执行节奏（通常保留默认）",
+    "type": "object",
+    "hint": "所有群共用；随机等待用于降低频率和避免操作堆积，不能保证规避QQ风控。",
+    "items": {
+      "notify_min": {
+        "description": "提醒前等待最短秒数",
+        "type": "int",
+        "default": 8,
+        "hint": "到时会重新核验，期间改好就取消。"
+      },
+      "notify_max": {
+        "description": "提醒前等待最长秒数",
+        "type": "int",
+        "default": 20,
+        "hint": "不能小于对应最短值；每次独立抽取随机值。"
+      },
+      "ban_min": {
+        "description": "提醒成功后到禁言之间等待最短秒数",
+        "type": "int",
+        "default": 3,
+        "hint": "期间再次核验；提醒失败不会禁言。"
+      },
+      "ban_max": {
+        "description": "提醒成功后到禁言之间等待最长秒数",
+        "type": "int",
+        "default": 8,
+        "hint": "不能小于对应最短值；每次独立抽取随机值。"
+      },
+      "unmute_min": {
+        "description": "发现合规后到解禁之间等待最短秒数",
+        "type": "int",
+        "default": 1,
+        "hint": "优先处理解禁，之后另行撤回。"
+      },
+      "unmute_max": {
+        "description": "发现合规后到解禁之间等待最长秒数",
+        "type": "int",
+        "default": 3,
+        "hint": "不能小于对应最短值；每次独立抽取随机值。"
+      },
+      "recall_min": {
+        "description": "撤回提醒前等待最短秒数",
+        "type": "int",
+        "default": 2,
+        "hint": "每条提醒分别等待并核对身份。"
+      },
+      "recall_max": {
+        "description": "撤回提醒前等待最长秒数",
+        "type": "int",
+        "default": 6,
+        "hint": "不能小于对应最短值；每次独立抽取随机值。"
+      },
+      "gap_min": {
+        "description": "同一账号两次写操作之间间隔最短秒数",
+        "type": "int",
+        "default": 3,
+        "hint": "所有群共用，最短至少1秒；兼容已有QQ自动化共享队列时可能额外等待。"
+      },
+      "gap_max": {
+        "description": "同一账号两次写操作之间间隔最长秒数",
+        "type": "int",
+        "default": 8,
+        "hint": "不能小于对应最短值；每次独立抽取随机值。"
+      },
+      "poll_min": {
+        "description": "等待修改的成员补查间隔最短秒数",
+        "type": "int",
+        "default": 60,
+        "hint": "只查待处理成员，最短30秒；超过1小时逐步放慢，最长10倍，读取预算耗尽会继续推迟。"
+      },
+      "poll_max": {
+        "description": "等待修改的成员补查间隔最长秒数",
+        "type": "int",
+        "default": 180,
+        "hint": "不能小于对应最短值；每次独立抽取随机值。"
+      },
+      "startup_min": {
+        "description": "普通启动或重载缓冲最短秒数",
+        "type": "int",
+        "default": 30,
+        "hint": "只影响新增处理；两项都填0可关闭这项缓冲。"
+      },
+      "startup_max": {
+        "description": "普通启动或重载缓冲最长秒数",
+        "type": "int",
+        "default": 90,
+        "hint": "不能小于对应最短值；每次独立抽取随机值。"
+      },
+      "recovery_min": {
+        "description": "异常恢复冷却最短秒数",
+        "type": "int",
+        "default": 300,
+        "hint": "连接异常或执行“恢复”后使用；已排定的冷却不会因调小配置而缩短。"
+      },
+      "recovery_max": {
+        "description": "异常恢复冷却最长秒数",
+        "type": "int",
+        "default": 900,
+        "hint": "不能小于对应最短值；每次独立抽取随机值。"
+      },
+      "group_hourly_reminders": {
+        "description": "每群最近1小时最多提醒几次",
+        "type": "int",
+        "default": 10,
+        "hint": "1～100；已提交但结果不明的请求也占额度。"
+      },
+      "account_hourly_reminders": {
+        "description": "每个QQ最近1小时最多提醒几次",
+        "type": "int",
+        "default": 30,
+        "hint": "1～300；本插件所有群合计。"
+      },
+      "account_daily_mutes": {
+        "description": "每个QQ最近24小时最多禁言几次",
+        "type": "int",
+        "default": 30,
+        "hint": "1～100；本插件所有群合计。解禁不占禁言额度。"
+      },
+      "reads_per_hour": {
+        "description": "每个QQ每小时资料读取预算",
+        "type": "int",
+        "default": 360,
+        "hint": "60～1200；为待处理核验和解禁预留额度。群多、待处理人多时，发现改名可能需要更久。"
+      },
+      "max_pending": {
+        "description": "每个QQ最多同时跟进多少人",
+        "type": "int",
+        "default": 30,
+        "hint": "1～100；达到上限优先完成已有事项。"
+      }
+    }
+  }
+}
