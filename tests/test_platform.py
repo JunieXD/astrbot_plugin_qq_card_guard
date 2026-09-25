@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -154,3 +155,34 @@ async def test_member_identity_is_verified(env):
     bot.result = {"user_id": U, "group_id": "999999"}
     with pytest.raises(GuardError, match="身份不一致"):
         await api.member(G, U)
+
+
+async def test_unrelated_offline_account_does_not_block_bound_account(env):
+    selected, offline = Bot(), Bot()
+    offline._wsr_api_clients = {}
+    platforms = [
+        SimpleNamespace(bot=b, meta=lambda i=i: SimpleNamespace(id=str(i), name="aiocqhttp"))
+        for i, b in enumerate((selected, offline))
+    ]
+    context = SimpleNamespace(platform_manager=SimpleNamespace(get_insts=lambda: platforms))
+    router = Router(context, env.store, lambda: env.box.settings.pace, env.journal)
+    found = await router.resolve(replace(env.policy, bot_qq=A), expected=("0", A))
+    assert found.account == A and found.pid == "0"
+    assert not offline.calls
+
+
+async def test_signed_onebot_message_id_is_retained(env):
+    bot = Bot()
+    api = adapter(env, bot)
+    await api.identity()
+    bot.result = {"message_id": -12345}
+    assert await api.notify(G, [], lambda: None) == "-12345"
+
+
+async def test_bad_sender_data_is_a_controlled_recall_failure(env):
+    bot = Bot()
+    api = adapter(env, bot)
+    await api.identity()
+    bot.result = {"sender": None}
+    with pytest.raises(GuardError, match="发送者资料"):
+        await api.locate_message({"message_id": "123"})

@@ -8,7 +8,7 @@ import secrets
 import time
 
 from .config import GuardError, Later
-from .rules import Member, message_fingerprint, number
+from .rules import Member, message_fingerprint, message_id, number
 
 WRITES = {"send_group_msg", "set_group_ban", "delete_msg"}
 
@@ -114,8 +114,8 @@ class Adapter:
         )
         return account
 
-    async def online(self):
-        data = await self.call("get_status", priority=2)
+    async def online(self, priority=2):
+        data = await self.call("get_status", priority=priority)
         connected = isinstance(data, dict) and data.get("online") is True and data.get("good", True) is True
         if not connected:
             self.generation += 1
@@ -149,9 +149,9 @@ class Adapter:
 
     async def notify(self, gid, message, before_send):
         data = await self.call("send_group_msg", group_id=gid, message=message, before_send=before_send)
-        if not isinstance(data, dict) or not number(data.get("message_id")):
+        if not isinstance(data, dict) or not message_id(data.get("message_id")):
             raise GuardError("提醒发送结果没有有效消息ID，停止后续禁言并等待核对。")
-        return str(data["message_id"])
+        return message_id(data["message_id"])
 
     async def ban(self, gid, uid, seconds, before_send):
         return await self.call(
@@ -163,6 +163,8 @@ class Adapter:
         if not isinstance(data, dict):
             raise GuardError("提醒消息无法定位，保留原消息。")
         sender = data.get("sender", {})
+        if not isinstance(sender, dict):
+            raise GuardError("提醒发送者资料缺失，无法确认归属。")
         valid = (
             str(data.get("group_id")) == case["gid"]
             and str(sender.get("user_id")) == self.account
@@ -187,6 +189,7 @@ class Router:
     async def resolve(self, policy, *, expected=None, priority=0):
         async with self.lock:
             found = []
+            available = []
             for platform in self.context.platform_manager.get_insts():
                 meta = platform.meta()
                 if meta.name != "aiocqhttp" or not hasattr(getattr(platform, "bot", None), "call_action"):
@@ -197,7 +200,26 @@ class Router:
                     adapter = self.adapters[pid] = Adapter(
                         pid, platform.bot, self.store, self.pace, self.journal
                     )
-                await adapter.identity(priority=priority)
+                available.append(adapter)
+            accounts = [account for adapter in available for account, _ in (adapter.client_token() or ())]
+            if len(accounts) != len(set(accounts)):
+                raise GuardError("同一QQ接入多个平台，请只保留一个接入。")
+            if len(available) > 1 and not policy.bot_qq:
+                raise GuardError("多QQ接入时请填写这个群负责的机器人QQ，防止重复管理。")
+            target_account = expected[1] if expected else policy.bot_qq
+            for adapter in available:
+                token = adapter.client_token()
+                advertised = {entry[0] for entry in token} if token else set()
+                if target_account and advertised and target_account not in advertised:
+                    continue
+                try:
+                    await adapter.identity(priority=priority)
+                except GuardError:
+                    if expected and adapter.pid != expected[0]:
+                        continue
+                    if policy.bot_qq and adapter.account and adapter.account != policy.bot_qq:
+                        continue
+                    raise
                 found.append(adapter)
             if len({a.account for a in found}) != len(found):
                 raise GuardError("同一QQ接入多个平台，请只保留一个接入。")

@@ -10,8 +10,16 @@ from .config import GuardError, Policy
 
 def number(value, *, zero=False):
     text = str(value)
-    if text.isascii() and text.isdecimal() and int(text) >= (0 if zero else 1):
+    if len(text) <= 20 and text.isascii() and text.isdecimal() and int(text) >= (0 if zero else 1):
         return int(text)
+    return None
+
+
+def message_id(value):
+    text = str(value)
+    digits = text[1:] if text.startswith("-") else text
+    if len(text) <= 20 and digits.isascii() and digits.isdecimal() and int(text) != 0:
+        return str(int(text))
     return None
 
 
@@ -109,6 +117,8 @@ def message_fingerprint(message):
         if not isinstance(segment, dict):
             return ""
         kind, data = segment.get("type"), segment.get("data", {})
+        if not isinstance(data, dict):
+            return ""
         if kind == "text":
             parts.append((kind, str(data.get("text", ""))))
         elif kind == "at":

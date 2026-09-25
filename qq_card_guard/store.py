@@ -6,6 +6,7 @@ import asyncio
 import json
 import secrets
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 
@@ -76,6 +77,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS subjects (key TEXT PRIMARY KEY, account TEXT, gid TEXT, uid TEXT,
                 eval_at REAL NOT NULL, data TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS subjects_work ON subjects(eval_at);
             CREATE TABLE IF NOT EXISTS cases (id TEXT PRIMARY KEY, account TEXT, gid TEXT, uid TEXT,
                 phase TEXT, due REAL, data TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS cases_work ON cases(phase,due);
@@ -88,6 +90,7 @@ class Store:
             CREATE INDEX IF NOT EXISTS reads_budget ON reads(account,at);
             CREATE TABLE IF NOT EXISTS exemptions (key TEXT PRIMARY KEY, until REAL, actor TEXT);
             CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, at REAL);
+            CREATE INDEX IF NOT EXISTS events_time ON events(at);
             CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, at REAL, event TEXT, data TEXT);
             PRAGMA user_version=1;
         """)
@@ -173,9 +176,11 @@ class Store:
                 "verified_at": 0,
                 "card_hint": None,
                 "card_at": 0,
+                "card_unconfirmed": False,
                 "role_hint": "",
                 "role_at": 0,
                 "ban": {},
+                "ban_serial": 0,
                 "platform": "",
             }
         )
@@ -206,13 +211,14 @@ class Store:
                 subject["speech_at"] = occurred
                 subject["received_at"] = now
                 if evaluate_enabled:
-                    subject["eval_at"] = min(subject["eval_at"] or now + 1, now + 1)
+                    subject["eval_at"] = subject["eval_at"] or now + 1
             if (
                 kind in ("message", "group_card")
                 and occurred >= subject["card_at"]
                 and isinstance(event.get("card"), str)
             ):
                 subject["card_hint"], subject["card_at"] = event["card"], occurred
+                subject["card_unconfirmed"] = event["card"] != subject["verified_card"]
             if kind in ("group_increase", "group_decrease") and occurred >= subject["membership_at"]:
                 subject["membership_at"] = occurred
                 subject["epoch"] += 1
@@ -220,10 +226,11 @@ class Store:
                 subject["waiting_join"] = kind == "group_increase"
                 subject["ban"] = {}
                 subject["role_hint"] = ""
-            if kind == "group_admin" and occurred >= subject["role_at"]:
+            if kind == "group_admin" and occurred >= max(subject["role_at"], subject["membership_at"]):
                 subject["role_at"] = occurred
                 subject["role_hint"] = "admin" if event["subtype"] == "set" else "member"
-            if kind == "group_ban" and occurred >= subject["ban"].get("at", 0):
+            if kind == "group_ban" and occurred >= max(subject["ban"].get("at", 0), subject["membership_at"]):
+                subject["ban_serial"] = subject.get("ban_serial", 0) + 1
                 subject["ban"] = {
                     "at": occurred,
                     "received": now,
@@ -246,8 +253,16 @@ class Store:
     def verified(self, account, gid, member, now):
         with self.db:
             subject = self.subject(account, gid, member.uid)
-            if not member.joined or member.joined > now + 300 or not subject["present"]:
+            if not member.joined or member.joined > now + 300:
                 raise GuardError("入群身份不明或成员已离群，暂缓处理。")
+            if not subject["present"]:
+                if member.joined <= subject["membership_at"]:
+                    raise GuardError("成员已离群，等待可确认的新入群身份。")
+                subject["present"] = True
+                subject["waiting_join"] = False
+                subject["epoch"] += 1
+                subject["ban"] = {}
+                subject["role_hint"] = ""
             if subject["waiting_join"]:
                 if member.joined < subject["membership_at"] - 5:
                     raise GuardError("入群通知与成员缓存冲突，暂缓处理。")
@@ -262,6 +277,8 @@ class Store:
             subject["joined"] = member.joined
             subject["verified_card"] = member.card
             subject["verified_at"] = now
+            if member.card == subject["card_hint"]:
+                subject["card_unconfirmed"] = False
             self._save_subject(subject)
             return subject
 
@@ -303,7 +320,7 @@ class Store:
 
     def _save_case(self, case):
         self.db.execute(
-            "INSERT OR REPLACE INTO cases VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO cases VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET phase=excluded.phase,due=excluded.due,data=excluded.data",
             (
                 case["id"],
                 case["account"],
@@ -360,9 +377,15 @@ class Store:
             self.db.execute("DELETE FROM exemptions WHERE key=?", (key(account, gid, uid),))
             self._audit(now, "取消豁免", {"account": account, "group": gid, "user": uid, "actor": actor})
 
-    def new_case(self, subject, policy, platform, connection, round_no, minutes, now, due):
+    def new_case(self, subject, policy, platform, connection, round_no, minutes, now, due, max_pending=100):
         with self.db:
-            for existing in self.member_cases(subject["account"], subject["gid"], subject["uid"]):
+            existing_cases = self.member_cases(subject["account"], subject["gid"], subject["uid"])
+            if (
+                not any(c["phase"] == "watch" for c in existing_cases)
+                and self.pending_count(subject["account"]) >= max_pending
+            ):
+                raise Later("待处理成员已达上限，优先完成现有核验。", now + 300)
+            for existing in existing_cases:
                 if existing["phase"] in ("notify", "ban", "review", "settle"):
                     raise GuardError("已有待处理事项，先完成当前核验。")
                 if existing["phase"] == "watch":
@@ -383,6 +406,7 @@ class Store:
                 "minutes": minutes,
                 "created": now,
                 "due": due,
+                "execute_before": due + 300,
                 "phase": "notify",
                 "next_round": 0,
                 "message_id": None,
@@ -510,5 +534,9 @@ class Store:
             (account,),
         ).fetchone()[0]
 
-    def maintain(self):
+    def maintain(self, now=None):
+        with self.db:
+            self.db.execute(
+                "DELETE FROM events WHERE at<?", ((time.time() if now is None else now) - 172800,)
+            )
         self.db.execute("PRAGMA wal_checkpoint(PASSIVE)")

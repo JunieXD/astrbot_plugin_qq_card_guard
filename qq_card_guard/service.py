@@ -8,7 +8,7 @@ import time
 from dataclasses import replace
 
 from .config import GuardError, Later, Policy, Stage, fingerprint
-from .rules import judge, matches, number
+from .rules import judge, number
 from .store import key
 
 
@@ -146,12 +146,20 @@ class Service:
             self.invalidate(a, g, u)
         if isinstance(card, str):
             self.card_hints[key(a, g, u)] = card
-        duration = get("duration", 0)
-        if kind == "group_ban" and (
-            get("sub_type") not in ("ban", "lift_ban")
-            or (number(duration, zero=True) is None and not (u == "0" and duration == -1))
-        ):
+        duration = 0
+        if kind == "group_admin" and get("sub_type") not in ("set", "unset"):
             return
+        if kind == "group_ban":
+            duration = number(get("duration"), zero=True)
+            if u == "0" and str(get("duration")) == "-1":
+                duration = -1
+            if (
+                get("sub_type") not in ("ban", "lift_ban")
+                or duration is None
+                or duration > 2592000
+                or not number(get("operator_id"))
+            ):
+                return
         event = {
             "account": a,
             "gid": g,
@@ -187,11 +195,17 @@ class Service:
         a, g = adapter.account, policy.group_id
         version = self.version(a, g, uid)
         first = await adapter.member(g, uid, priority)
-        second = await adapter.member(g, uid, priority) if stable else first
+        hint = await self.store.call("subject", a, g, uid)
+        reconcile_role = (
+            hint["role_hint"] == "admin" and hint["role_at"] < self.clock() - 300 and first.role == "member"
+        )
+        second = await adapter.member(g, uid, priority) if stable or reconcile_role else first
         if version != self.version(a, g, uid):
             raise Later("核验期间资料变化，稍后重新核验。", self.clock() + 5)
         if first.card != second.card or first.joined != second.joined:
             raise Later("成员资料缓存尚未一致，稍后核验。", self.clock() + 15)
+        if stable and first.muted_until != second.muted_until:
+            raise Later("禁言资料正在变化，稍后核验。", self.clock() + 15)
 
         # Protective facts from both responses win over a later stale cache.
         def high(left, right):
@@ -199,7 +213,9 @@ class Service:
 
         member = replace(
             second,
-            role=first.role if first.role in ("admin", "owner") else second.role,
+            role=(first.role if first.role in ("admin", "owner") else second.role)
+            if first.role in ("admin", "owner", "member") and second.role in ("admin", "owner", "member")
+            else "",
             title=(first.title or second.title)
             if first.title is not None and second.title is not None
             else None,
@@ -209,17 +225,20 @@ class Service:
             robot=first.robot or second.robot,
         )
         subject = await self.store.call("verified", a, g, member, self.clock())
-        if subject["role_hint"] == "admin":
+        if subject["role_hint"] == "admin" and not (
+            reconcile_role and subject["role_at"] == hint["role_at"] and first.role == second.role
+        ):
             member = replace(member, role="admin")
         manual = await self.store.call("exempt", a, g, uid, self.clock())
         verdict = judge(policy, member, a, manual)
         if (
-            verdict.state == "invalid"
+            verdict.state != "exempt"
+            and subject.get("card_unconfirmed", False)
             and subject["card_at"] > self.clock() - 300
             and subject["card_hint"] is not None
-            and matches(policy, subject["card_hint"])
+            and subject["card_hint"] != member.card
         ):
-            raise Later("已观察到合规名片，等待接口缓存更新。", self.clock() + 15)
+            raise Later("新名片通知与接口缓存不一致，等待资料更新。", self.clock() + 15)
         self.journal.record(
             "名片判断",
             screening=True,
@@ -238,15 +257,26 @@ class Service:
 
     async def authorize(self, policy, actor, pid, account):
         adapter = await self.router.resolve(policy, expected=(pid, account), priority=2)
-        member = await adapter.member(policy.group_id, actor, 2)
-        subject = await self.store.call("subject", account, policy.group_id, actor)
-        if (
-            member.role not in ("admin", "owner")
-            or not subject["present"]
-            or subject["role_hint"] == "member"
-        ):
+        if not await self.manager(adapter, policy.group_id, actor):
             raise GuardError("只有该群当前的群主或管理员可以使用此命令。")
         return adapter
+
+    async def manager(self, adapter, gid, uid, priority=2):
+        version = self.version(adapter.account, gid, uid)
+        first = await adapter.member(gid, uid, priority)
+        hint = await self.store.call("subject", adapter.account, gid, uid)
+        negative = hint["role_hint"] == "member"
+        if negative and hint["role_at"] >= self.clock() - 300:
+            return False
+        second = await adapter.member(gid, uid, priority) if negative or not hint["present"] else first
+        if (
+            first.role not in ("admin", "owner")
+            or second.role not in ("admin", "owner")
+            or first.joined != second.joined
+        ):
+            return False
+        await self.store.call("verified", adapter.account, gid, second, self.clock())
+        return version == self.version(adapter.account, gid, uid)
 
     async def evaluate(self, subject, adapter):
         self.healthy()
@@ -272,10 +302,11 @@ class Service:
         elif verdict.state == "invalid" and policy.mode != "仅观察":
             if await self.store.call("get", "block:" + a, {}):
                 raise Later("账号新操作已暂停，请查看状态和待核对记录。", self.clock() + 300)
-            all_ban = (await self.store.call("subject", a, g, "0"))["ban"]
-            if all_ban and all_ban["duration"] != 0:
-                raise Later("群处于全员禁言，暂缓新增处理。", self.clock() + 300)
-            if member.muted_until is None or member.muted_until > self.clock():
+            if (
+                member.muted_until is None
+                or member.muted_until > self.clock()
+                or current["ban"].get("until", 0) > self.clock()
+            ):
                 await self.store.call("evaluated", a, g, u, subject["speech_at"])
                 return
             cases = await self.store.call("member_cases", a, g, u)
@@ -312,6 +343,7 @@ class Service:
                 minutes,
                 self.clock(),
                 self.clock() + random.uniform(*settings.pace.interval("notify")),
+                settings.pace.max_pending,
             )
             self.journal.record(
                 "安排提醒", case=case["id"], account=a, group=g, user=u, round=round_no, due=case["due"]
@@ -368,7 +400,11 @@ class Service:
             async with self.member_lock(a, g, u):
                 policy = self.policy(item) if kind == "case" else self.settings().group(g)
                 adapter = await self.router.resolve(
-                    policy, expected=(item["platform"], a), priority=2 if kind == "case" else 0
+                    policy,
+                    expected=(item["platform"], a),
+                    priority=(2 if item["phase"] == "settle" else 1 if item["phase"] == "watch" else 0)
+                    if kind == "case"
+                    else 0,
                 )
                 if kind == "case":
                     await Executor(self).process(await self.store.call("case", item["id"]), adapter)
@@ -382,6 +418,8 @@ class Service:
             try:
                 if kind == "case":
                     await self.store.call("patch_case", item["id"], {"due": until, "reason": str(exc)})
+                elif policy is None:
+                    await self.store.call("evaluated", a, g, u, item["speech_at"])
                 else:
                     await self.store.call("defer_evaluation", a, g, u, until)
             except GuardError:
@@ -418,7 +456,7 @@ class Service:
                 await self.tick()
                 if self.clock() >= checkpoint:
                     await self.store.call("set", "last-wall", self.clock())
-                    await self.store.call("maintain")
+                    await self.store.call("maintain", self.clock())
                     self.journal.maintain()
                     checkpoint = self.clock() + 60
             except GuardError as exc:

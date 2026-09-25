@@ -75,6 +75,16 @@ class Executor:
                 )
                 return
         if phase in ("notify", "ban", "settle"):
+            if phase == "settle" and self.s.policy(case).unmute_on_compliance:
+                for other in await self.db.call("member_cases", case["account"], case["gid"], case["uid"]):
+                    if (
+                        other["id"] != case["id"]
+                        and other["phase"] == "settle"
+                        and other["mute_state"] in ("owned", "unverified")
+                        and other["mute_until"] > self.now()
+                        and case["mute_state"] not in ("owned", "unverified")
+                    ):
+                        raise Later("先完成此成员当前禁言的解禁核验。", max(self.now() + 1, other["due"]))
             await self.write(case, adapter, phase)
         elif phase in ("watch", "review"):
             await self.watch(case, adapter)
@@ -104,6 +114,11 @@ class Executor:
         notice = subject["ban"]
         if not operation or operation["status"] != "confirmed":
             return "manual"
+        baseline = case.get("ban_baseline")
+        if baseline is None:
+            return "manual"
+        if subject.get("ban_serial", 0) > baseline + 1:
+            return "external"
         if not notice or notice["received"] < case["ban_at"] - 1:
             return "unverified"
         if (
@@ -138,19 +153,17 @@ class Executor:
             await self.poll(case, mute_state=state, reason=verdict.reason)
 
     async def bot_permission(self, case, adapter, priority=2):
-        bot = await adapter.member(case["gid"], adapter.account, priority)
-        hint = await self.db.call("subject", adapter.account, case["gid"], adapter.account)
-        if bot.role not in ("admin", "owner") or not hint["present"] or hint["role_hint"] == "member":
+        if not await self.s.manager(adapter, case["gid"], adapter.account, priority):
             raise Later("机器人当前没有可确认的群管理权限。", self.now() + 300)
 
     async def write(self, case, adapter, phase):
         lock = self.s.account_locks.setdefault(adapter.account, asyncio.Lock())
-        async with lock:
-            new = phase in ("notify", "ban")
-            await self.gate(case, adapter, new)
-            guard = self.s.router.shared_guard()
+        new = phase in ("notify", "ban")
+        await self.gate(case, adapter, new)
+        guard = self.s.router.shared_guard()
 
-            async def attempt():
+        async def attempt():
+            async with lock:
                 try:
                     # Shared queue waits may be arbitrarily long. All facts are read afterwards.
                     await self.gate(case, adapter, new)
@@ -160,34 +173,50 @@ class Executor:
                         raise guard.deferred_error(str(exc)) from exc
                     raise
 
-            if guard:
-                pace = self.s.settings().pace
-                try:
-                    await guard.run(
-                        account=adapter.pid,
-                        online=adapter.online,
-                        action=attempt,
-                        config={
-                            "recovery_min_seconds": pace.recovery_min,
-                            "recovery_max_seconds": pace.recovery_max,
-                            "failure_threshold": 1,
-                            "failure_cooldown_seconds": 900,
-                        },
-                        delay=(0, 0),
-                        gap=pace.interval("gap"),
-                        key=None,
-                    )
-                except guard.deferred_error as exc:
-                    cause = exc.__cause__
-                    raise Later(str(exc), getattr(cause, "until", self.now() + 60)) from exc
-            else:
-                if not await adapter.online():
-                    raise Later("QQ当前离线，等待连接恢复。", self.now() + 300)
-                await attempt()
+        async def online():
+            return await adapter.online(priority=0 if new else 2)
+
+        if guard:
+            pace = self.s.settings().pace
+            options = {}
+            if getattr(guard, "scheduling_version", 1) >= 3:
+                options = dict(priority=2 if new else 1, group=case["gid"], label="名片规范")
+            try:
+                await guard.run(
+                    account=adapter.pid,
+                    online=online,
+                    action=attempt,
+                    config={
+                        "recovery_min_seconds": pace.recovery_min,
+                        "recovery_max_seconds": pace.recovery_max,
+                        "failure_threshold": 1,
+                        "failure_cooldown_seconds": 900,
+                    },
+                    delay=(0, 0),
+                    gap=pace.interval("gap"),
+                    key=None,
+                    **options,
+                )
+            except guard.deferred_error as exc:
+                cause = exc.__cause__
+                raise Later(str(exc), getattr(cause, "until", self.now() + 60)) from exc
+        else:
+            if not await online():
+                raise Later("QQ当前离线，等待连接恢复。", self.now() + 300)
+            await attempt()
 
     async def attempt(self, case, adapter, phase):
-        policy = self.s.policy(case)
         new = phase in ("notify", "ban")
+        try:
+            policy = self.s.settings().group(case["gid"]) if new else self.s.policy(case)
+        except GuardError:
+            await self.patch(
+                case,
+                phase="watch" if case["message_id"] else "closed",
+                reason="群配置已移除或无效，取消未提交的处罚",
+                due=self.now(),
+            )
+            return
         if new:
             if (
                 not self.s.settings().enabled
@@ -203,7 +232,9 @@ class Executor:
                     due=self.now(),
                 )
                 return
-            deadline = case["created"] + 300 if phase == "notify" else case["sent_at"] + 120
+            deadline = case.get(
+                "execute_before", case["created"] + 300 if phase == "notify" else case["sent_at"] + 120
+            )
             if self.now() > deadline:
                 await self.patch(
                     case,
@@ -214,13 +245,15 @@ class Executor:
                 return
         versions = self.versions(case)
         stamp = adapter.stamp()
+        prepared_at = self.now()
+        if await adapter.identity(force=True, priority=0 if new else 2) != case["account"]:
+            raise GuardError("提交前机器人身份改变，请重新核对账号绑定。")
         await self.bot_permission(case, adapter, 0 if new else 2)
         if new and await adapter.all_muted(case["gid"]):
             raise Later("全员禁言期间暂停新增处理。", self.now() + 300)
         member, subject, verdict = await self.inspect_case(
             case, adapter, stable=True, priority=0 if new else 2
         )
-        prepared_at = self.now()
         if new and (member is None or verdict.state in ("compliant", "exempt")):
             await self.patch(
                 case,
@@ -233,13 +266,16 @@ class Executor:
             raise Later(verdict.reason, self.now() + 300)
         if new and member.muted_until is None:
             raise Later("当前禁言状态未知，暂缓。", self.now() + 300)
-        if new and member.muted_until > self.now():
+        if new and (member.muted_until > self.now() or subject["ban"].get("until", 0) > self.now()):
             await self.patch(
                 case,
                 phase="watch" if case["message_id"] else "closed",
                 reason="成员已被禁言，不覆盖管理员操作",
                 due=self.now() + self.delay("poll"),
             )
+            return
+        if phase == "ban" and subject.get("ban_serial", 0) != case.get("notice_serial", 0):
+            await self.poll(case, phase="watch", reason="提醒后已有人操作禁言，本轮不再覆盖")
             return
         if phase == "settle":
             if member and verdict.state not in ("compliant", "exempt"):
@@ -300,9 +336,14 @@ class Executor:
             self.s.healthy()
             if adapter.stamp() != stamp or self.versions(case) != versions or self.now() - prepared_at > 20:
                 raise Later("提交前资料或连接变化，已取消本次发送。", self.now() + 5)
-            current = self.s.policy(case)
+            try:
+                current = self.s.settings().group(case["gid"]) if new else self.s.policy(case)
+            except GuardError as exc:
+                raise Later("提交前群配置已移除或无效，取消发送。", self.now() + 1) from exc
             if current.revision != policy.revision:
                 raise Later("提交前配置变化，已取消本次发送。", self.now() + 5)
+            if new and self.now() > deadline:
+                raise Later("提交前处理已过期，取消发送。", self.now() + 1)
             if new and (
                 not self.s.settings().enabled
                 or not current.enabled
@@ -315,6 +356,11 @@ class Executor:
         pace = self.s.settings().pace
         try:
             oid = await self.db.call("reserve", case, kind, self.now(), payload, policy, pace)
+        except asyncio.CancelledError:
+            reserved = await self.db.call("has_operation", case["id"], kind)
+            if reserved and reserved["status"] == "submitted":
+                await self.db.call("cancel_unsent", reserved["id"], self.now())
+            raise
         except Later as exc:
             if kind == "ban":
                 await self.poll(case, phase="watch", reason=str(exc))
@@ -327,6 +373,7 @@ class Executor:
             at = self.now()
             if kind == "notify":
                 result = await adapter.notify(case["gid"], message, fence)
+                due = self.now() + self.delay("ban" if case["minutes"] else "poll")
                 next_round = (
                     at
                     + max(
@@ -344,7 +391,9 @@ class Executor:
                     next_round=next_round,
                     phase="ban" if case["minutes"] else "watch",
                     reason="已提醒，等待名片修改",
-                    due=self.now() + self.delay("ban" if case["minutes"] else "poll"),
+                    due=due,
+                    execute_before=due + 120,
+                    notice_serial=subject.get("ban_serial", 0),
                 )
             elif kind in ("ban", "unmute"):
                 seconds = case["minutes"] * 60 if kind == "ban" else 0
@@ -353,6 +402,7 @@ class Executor:
                     changes = dict(
                         phase="watch",
                         ban_at=at,
+                        ban_baseline=subject.get("ban_serial", 0),
                         mute_until=at + seconds,
                         next_round=max(case["next_round"], at + seconds),
                         mute_state="unverified",
@@ -381,6 +431,10 @@ class Executor:
         except BaseException as exc:
             if not sent:
                 await self.db.call("cancel_unsent", oid, self.now())
+                raise
+            recorded = await self.db.call("has_operation", case["id"], kind)
+            if recorded and recorded["status"] == "confirmed":
+                # Database cancellation drains the transaction before raising; keep its known result.
                 raise
             # The request may have reached QQ. A timeout or cancellation is not a failed effect.
             changes = self.uncertain_changes(kind, "操作返回异常或中断，结果需要核对")

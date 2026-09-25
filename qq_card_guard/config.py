@@ -126,7 +126,7 @@ def fingerprint(value):
 
 def integer(value, label, low, high):
     text = str(value)
-    if not text.isascii() or not text.isdecimal() or not low <= int(text) <= high:
+    if len(text) > 20 or not text.isascii() or not text.isdecimal() or not low <= int(text) <= high:
         raise GuardError(f"{label}应为 {low}～{high} 的整数。")
     return int(text)
 
@@ -170,7 +170,7 @@ def parse_policy(raw):
         raise GuardError("请填写1～2000字的名片正则。")
     try:
         regex.compile(pattern)
-    except regex.error as exc:
+    except (regex.error, RecursionError, OverflowError) as exc:
         raise GuardError("名片正则语法错误，请使用测试命令或检查配置。") from exc
     whitelist = raw.get("exempt_users", [])
     if not isinstance(whitelist, list) or len(whitelist) > 2000:
@@ -188,10 +188,10 @@ def parse_policy(raw):
     for key in ("format_help", "example"):
         if (
             not isinstance(raw.get(key, getattr(Policy, key)), str)
-            or not 1 <= len(raw.get(key, getattr(Policy, key))) <= 300
+            or not 1 <= len(raw.get(key, getattr(Policy, key)).strip()) <= 300
         ):
             raise GuardError("格式说明和正确示例应填写1～300字。")
-    return Policy(
+    policy = Policy(
         group_id=gid,
         enabled=switch(raw, "enabled", True),
         mode=mode,
@@ -215,6 +215,12 @@ def parse_policy(raw):
         stages=tuple(parsed_stages),
         bot_qq=qq(more.get("bot_qq", ""), optional=True),
     )
+    if not policy.reminder.strip():
+        raise GuardError("提醒内容不能是空白。")
+    for round_no in range(1, len(policy.stages) + 1):
+        if len(policy.render("9999999999999", round_no, 1440)) > 2000:
+            raise GuardError("占位符展开后的提醒超过2000字，请缩短模板或格式说明。")
+    return policy
 
 
 def parse_settings(raw):

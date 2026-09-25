@@ -72,7 +72,7 @@ class FakeAdapter:
     async def identity(self, force=False, priority=0):
         return self.account
 
-    async def online(self):
+    async def online(self, priority=2):
         return self.connected
 
     async def all_muted(self, gid):

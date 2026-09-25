@@ -107,6 +107,7 @@ class Commands:
                 raise GuardError("请填写目标QQ号。")
             uid = qq(values[0])
             async with self.s.member_lock(a, g, uid):
+                adapter = await self.s.authorize(policy, actor, pid, a)
                 if action == "检查":
                     member, _, verdict = await self.s.inspect(policy, adapter, uid, priority=2)
                     return (
@@ -138,6 +139,7 @@ class Commands:
             if case["account"] != a or case["gid"] != g:
                 raise GuardError("该记录不属于当前群和机器人。")
             async with self.s.member_lock(a, g, case["uid"]):
+                adapter = await self.s.authorize(policy, actor, pid, a)
                 case = await self.db.call("case", case["id"])
                 if action == "核对":
                     member = await adapter.member(g, case["uid"], 2)
