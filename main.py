@@ -16,7 +16,7 @@ from .qq_card_guard.service import Service
 from .qq_card_guard.store import Store
 
 
-@register("astrbot_plugin_qq_card_guard", "JunieXD", "按群名片规则提醒，支持阶梯禁言和改名后恢复", "0.2.0")
+@register("astrbot_plugin_qq_card_guard", "JunieXD", "按群名片规则提醒，支持阶梯禁言和改名后恢复", "0.2.1")
 class QQCardGuard(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context=context, config=config)
@@ -47,7 +47,7 @@ class QQCardGuard(Star):
             for gid, error in settings.errors:
                 logger.warning("QQ 群名片规范：群 %s 配置无效：%s", gid, error)
             logger.info(
-                "QQ 群名片规范 v0.2.0 已加载；发言检查：%s；有效群：%s；查询上限：%s/小时。",
+                "QQ 群名片规范 v0.2.1 已加载；发言检查：%s；有效群：%s；查询上限：%s/小时。",
                 "开启" if settings.enabled else "关闭",
                 len(settings.groups),
                 settings.pace.reads_per_hour,

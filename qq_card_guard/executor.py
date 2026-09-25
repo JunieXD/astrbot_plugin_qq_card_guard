@@ -52,19 +52,30 @@ class Executor:
         self.s.healthy()
         pace = self.s.settings().pace
         adapter.stamp()
-        until = max(
-            adapter.recovery_until,
-            await self.db.call("get", "recovery:" + adapter.account, 0),
-            await self.db.call("get", "gap:" + adapter.account, 0),
-        )
+        deadlines = {
+            "connection_recovery": adapter.recovery_until,
+            "manual_recovery": await self.db.call("get", "recovery:" + adapter.account, 0),
+            "operation_gap": await self.db.call("get", "gap:" + adapter.account, 0),
+        }
         if new:
-            until = max(until, await self.db.call("get", "startup", 0))
+            deadlines["startup_wait"] = await self.db.call("get", "startup", 0)
             if await self.db.call("get", "block:" + adapter.account, {}):
                 raise Later("账号有结果不明的操作，新增处理已暂停。", self.now() + 300)
             if await self.db.call("get", "pause:" + key(adapter.account, case["gid"]), ""):
                 raise Later("本群已暂停新增处理。", self.now() + 300)
-        if until > self.now():
-            raise Later("等待操作间隔或连接恢复冷却。", until)
+        now = self.now()
+        waits = {code: until for code, until in deadlines.items() if until > now}
+        if waits:
+            code = max(waits, key=waits.get)
+            reasons = {
+                "connection_recovery": "等待连接恢复冷却。",
+                "manual_recovery": "等待管理员恢复后的冷却。",
+                "operation_gap": "等待操作间隔。",
+                "startup_wait": "等待插件启动缓冲。",
+            }
+            raise Later(
+                reasons[code], waits[code], code=code, waits=waits, wait_seconds=round(waits[code] - now, 3)
+            )
         return pace
 
     async def process(self, case, adapter):
@@ -334,7 +345,7 @@ class Executor:
                     raise
                 except GuardError as exc:
                     await self.patch(case, phase="closed", recall_state="manual", reason=str(exc))
-                    self.s.journal.record("旧提醒需人工撤回", case=case["id"], exception=exc)
+                    self.s.journal.record("旧提醒无法自动撤回", case=case["id"], exception=exc)
                     return
         else:
             kind = phase

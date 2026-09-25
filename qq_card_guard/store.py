@@ -334,6 +334,16 @@ class Store:
             self._save_subject(subject)
             return True
 
+    def invalidate_screening(self, account, gid, uid, expected, reason, now):
+        """Retire one stale cache once, without clearing a newer verification."""
+        with self.db:
+            subject = self.subject(account, gid, uid)
+            if not expected or subject.get("screening") != expected:
+                return False
+            self._clear_screening(subject, reason, now)
+            self._save_subject(subject)
+            return True
+
     def metric(self, account, gid, name, now, detail=None):
         with self.db:
             k = "stats:" + key(account, gid)

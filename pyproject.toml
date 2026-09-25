@@ -1,11 +1,17 @@
 [project]
 name = "astrbot-plugin-qq-card-guard"
-version = "0.2.0"
+version = "0.2.1"
 requires-python = ">=3.10"
 dependencies = ["regex>=2024.11.6"]
 
 [dependency-groups]
-dev = ["pytest>=8,<10", "pytest-asyncio>=0.23,<2", "ruff>=0.11,<1", "pyyaml>=6,<7"]
+dev = [
+    "pytest>=8,<10",
+    "pytest-asyncio>=0.23,<2",
+    "ruff>=0.11,<1",
+    "pyyaml>=6,<7",
+    "aiocqhttp>=1.4.4,<2",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

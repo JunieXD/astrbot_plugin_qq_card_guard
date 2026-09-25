@@ -12,11 +12,44 @@ class GuardError(Exception):
     """Administrator-safe error text, without transport credentials."""
 
 
+class ApiFailure(GuardError):
+    """OneBot returned a failure response; this alone does not imply disconnection."""
+
+    def __init__(self, action, result):
+        result = result if isinstance(result, dict) else {}
+        self.action = action
+        self.retcode = result.get("retcode") if type(result.get("retcode")) is int else None
+        self.response = {
+            field: result[field]
+            for field in ("status", "message", "wording")
+            if isinstance(result.get(field), str)
+        }
+        self.code = "api_business_failure"
+        if action == "get_msg" and any(
+            isinstance(result.get(field), str) and result[field].strip() == "消息不存在"
+            for field in ("message", "wording")
+        ):
+            self.code = "message_not_found"
+            message = "NapCat查询不到这条提醒，无法确认撤回结果，请人工核对。"
+        else:
+            code = self.retcode if self.retcode is not None else "未知"
+            message = f"{action}返回业务失败（返回码：{code}），请检查NapCat日志和权限。"
+        super().__init__(message)
+
+
 class Later(GuardError):
     def __init__(self, message, until, *, code="deferred", **details):
         super().__init__(message)
         self.until = until
         self.code, self.details = code, details
+
+    @property
+    def routine(self):
+        return self.code in {
+            "operation_gap",
+            "startup_wait",
+            "manual_recovery",
+        } and "connection_recovery" not in self.details.get("waits", {})
 
 
 MODES = ("仅观察", "只提醒", "提醒并禁言")

@@ -8,7 +8,9 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 
-from .config import GuardError, Later
+from aiocqhttp.exceptions import ActionFailed
+
+from .config import ApiFailure, GuardError, Later
 from .rules import Member, message_fingerprint, message_id, number
 
 WRITES = {"send_group_msg", "set_group_ban", "delete_msg"}
@@ -93,6 +95,8 @@ class Adapter:
                         result = await asyncio.wait_for(asyncio.create_task(invoke()), timeout=25)
                     except GuardError:
                         raise
+                    except ActionFailed as exc:
+                        raise ApiFailure(action, exc.result) from exc
                     except Exception as exc:
                         self.generation += 1
                         self.identity_at = 0
@@ -105,7 +109,7 @@ class Adapter:
                         ) from exc
                     if isinstance(result, dict) and ("retcode" in result or "status" in result):
                         if result.get("status") != "ok" or result.get("retcode", 0) != 0:
-                            raise GuardError(f"{action}返回失败，请检查权限和账号状态。")
+                            raise ApiFailure(action, result)
                         result = result.get("data")
                     return result
             finally:

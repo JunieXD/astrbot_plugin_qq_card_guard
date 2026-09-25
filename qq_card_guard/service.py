@@ -333,8 +333,13 @@ class Service:
                 valid_until=cached["until"],
             )
             return True
-        if subject.get("screening"):
-            self.journal.record("免查缓存失效", account=a, group=g, user=u, reason=reason)
+        # A router that has not resolved yet is not evidence that the connection changed.
+        if subject.get("screening") and not (connection is None and reason == "连接已变化或未确认"):
+            cleared = await self.store.call(
+                "invalidate_screening", a, g, u, subject["screening"], reason, self.clock()
+            )
+            if cleared:
+                self.journal.record("免查缓存失效", account=a, group=g, user=u, reason=reason)
         return False
 
     async def authorize(self, policy, actor, pid, account):

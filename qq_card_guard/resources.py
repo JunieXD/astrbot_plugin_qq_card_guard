@@ -18,7 +18,7 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .config import GuardError
+from .config import ApiFailure, GuardError, Later
 
 _LOG_CONTEXT = ContextVar("qq_card_guard_log_context", default={})
 
@@ -164,8 +164,18 @@ class Journal:
     def record(self, kind: str, detail: str = "", *, exception=None, screening=False, **fields):
         level = "INFO"
         if exception is not None:
-            level = "WARNING" if isinstance(exception, (GuardError, asyncio.CancelledError)) else "ERROR"
-            fields["exception"] = exception_detail(exception)
+            if isinstance(exception, Later):
+                fields.setdefault("reason", str(exception))
+                fields.setdefault("code", exception.code)
+                fields.setdefault("retry_at", exception.until)
+                fields.setdefault("limits", exception.details)
+            if not (isinstance(exception, Later) and exception.routine):
+                level = "WARNING" if isinstance(exception, (GuardError, asyncio.CancelledError)) else "ERROR"
+                fields["exception"] = exception_detail(exception)
+            if isinstance(exception, ApiFailure):
+                fields.update(failure_kind="business", api=exception.action, retcode=exception.retcode)
+                fields["api_response"] = exception.response
+                fields.setdefault("code", exception.code)
         # Business fields must never overwrite severity or the event identity.
         context = {**_LOG_CONTEXT.get(), **fields}
         if "level" in context:

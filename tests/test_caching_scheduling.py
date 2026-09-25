@@ -124,6 +124,70 @@ async def test_cached_skip_runs_before_identity_lookup_even_when_budget_full(env
     assert not (await env.store.call("subject", A, G, U))["eval_at"]
 
 
+async def test_expired_cache_logs_once_across_preflight_retry_and_reverification(env):
+    compliant(env)
+    await env.speak()
+    env.clock.now += 3601
+    subject = await queue(env)
+    env.router.known_stamp = lambda *_: env.adapter.stamp()
+    original = env.router.resolve
+
+    async def unavailable(*args, **kwargs):
+        raise Later("读取额度耗尽", env.clock() + 60, code="read_budget")
+
+    env.router.resolve = unavailable
+    await env.service._work("subject", subject)
+    await env.service._work("subject", subject)
+    assert not (await env.store.call("subject", A, G, U)).get("screening")
+    env.router.resolve = original
+    env.clock.now += 61
+    await env.service._work("subject", subject)
+
+    def invalidations():
+        return [r for r in env.journal.records if r["kind"] == "免查缓存失效"]
+
+    assert len(invalidations()) == 1
+    assert len(env.adapter.reads) == 2
+    # The next cache lifetime must still produce its own invalidation record.
+    env.clock.now += 3601
+    await env.service._work("subject", await queue(env, 1000))
+    assert len(invalidations()) == 2
+    assert len(env.adapter.reads) == 3
+
+
+async def test_unresolved_connection_does_not_retire_cache_before_identity_resolution(env):
+    compliant(env)
+    await env.speak()
+    subject = await queue(env)
+    assert not await env.service.preflight(subject, env.policy, None)
+    assert (await env.store.call("subject", A, G, U)).get("screening")
+    assert await env.service.preflight(subject, env.policy, env.adapter.stamp())
+    assert not [r for r in env.journal.records if r["kind"] == "免查缓存失效"]
+
+
+async def test_stale_preflight_cannot_remove_newer_cache(env):
+    compliant(env)
+    await env.speak()
+    env.clock.now += 3601
+    stale = await queue(env)
+    await env.service.inspect(env.policy, env.adapter, U)
+    fresh = (await env.store.call("subject", A, G, U))["screening"]
+    assert not await env.service.preflight(stale, env.policy, env.adapter.stamp())
+    assert (await env.store.call("subject", A, G, U))["screening"] == fresh
+    assert not [r for r in env.journal.records if r["kind"] == "免查缓存失效"]
+
+
+async def test_card_notice_invalidation_not_logged_again_by_preflight(env):
+    compliant(env)
+    await env.speak()
+    env.adapter.people[U] = replace(env.adapter.people[U], card="bad")
+    await env.notice("group_card", card_new="bad")
+    await env.service._work("subject", await queue(env))
+    invalidations = [r for r in env.journal.records if r["kind"] == "免查缓存失效"]
+    assert len(invalidations) == 1 and invalidations[0]["reason"] == "名片变化"
+    assert (await env.store.call("member_cases", A, G, U))[0]["phase"] == "notify"
+
+
 async def test_same_second_new_event_not_cleared_by_old_completion(env):
     compliant(env)
     old = await queue(env, 991)

@@ -1,7 +1,7 @@
 name: astrbot_plugin_qq_card_guard
 desc: 分群匹配名片格式，发言后提醒，可选阶梯禁言；改好后核验解禁并撤回提醒。
 help: 在配置中添加群并测试正则。私聊机器人发送 /名片规范 查看帮助。默认仅观察。
-version: v0.2.0
+version: v0.2.1
 author: JunieXD
 repo: https://github.com/JunieXD/astrbot_plugin_qq_card_guard
 display_name: QQ 群名片规范
