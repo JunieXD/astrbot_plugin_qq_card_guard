@@ -204,9 +204,11 @@ class Store:
                 return False
             a, g, u = event["account"], event["gid"], event["uid"]
             subject = self.subject(a, g, u)
+            had_cache = bool(subject.get("screening"))
             subject["platform"] = event["platform"]
             subject["version"] += 1
             kind, occurred = event["kind"], event["at"]
+            invalidated = ""
             if kind == "message" and occurred >= subject["speech_at"]:
                 subject["speech_at"] = occurred
                 subject["received_at"] = now
@@ -217,9 +219,12 @@ class Store:
                 and occurred >= subject["card_at"]
                 and isinstance(event.get("card"), str)
             ):
+                if event["card"] != subject["card_hint"]:
+                    invalidated = "名片变化"
                 subject["card_hint"], subject["card_at"] = event["card"], occurred
                 subject["card_unconfirmed"] = event["card"] != subject["verified_card"]
             if kind in ("group_increase", "group_decrease") and occurred >= subject["membership_at"]:
+                invalidated = "成员离群或重新入群"
                 subject["membership_at"] = occurred
                 subject["epoch"] += 1
                 subject["present"] = kind == "group_increase"
@@ -227,9 +232,11 @@ class Store:
                 subject["ban"] = {}
                 subject["role_hint"] = ""
             if kind == "group_admin" and occurred >= max(subject["role_at"], subject["membership_at"]):
+                invalidated = "群角色变化"
                 subject["role_at"] = occurred
                 subject["role_hint"] = "admin" if event["subtype"] == "set" else "member"
             if kind == "group_ban" and occurred >= max(subject["ban"].get("at", 0), subject["membership_at"]):
+                invalidated = "禁言状态变化"
                 subject["ban_serial"] = subject.get("ban_serial", 0) + 1
                 subject["ban"] = {
                     "at": occurred,
@@ -238,17 +245,20 @@ class Store:
                     "duration": event["duration"],
                     "until": occurred + event["duration"],
                 }
+            if invalidated:
+                self._clear_screening(subject, invalidated, now)
             self._save_subject(subject)
             # A card/admin/ban notice expedites existing follow-up, never creates punishment.
-            if kind != "message":
+            if kind != "message" or invalidated == "名片变化":
                 for row in self.db.execute(
                     "SELECT data FROM cases WHERE account=? AND gid=? AND uid=? AND phase IN ('watch','review')",
                     (a, g, u),
                 ).fetchall():
                     case = json.loads(row[0])
-                    case["due"] = min(case["due"], now + 1)
+                    # Notices can wake a slow tier, but cannot defeat a read-budget backoff.
+                    case["due"] = max(min(case["due"], now + 1), case.get("read_defer_until", 0))
                     self._save_case(case)
-            return True
+            return {"cache_invalidated": invalidated if had_cache else ""}
 
     def verified(self, account, gid, member, now):
         with self.db:
@@ -282,18 +292,62 @@ class Store:
             self._save_subject(subject)
             return subject
 
-    def evaluated(self, account, gid, uid, speech_at):
+    def evaluated(self, account, gid, uid, speech_at, version=None):
         with self.db:
             subject = self.subject(account, gid, uid)
-            if subject["speech_at"] <= speech_at:
+            if subject["speech_at"] <= speech_at and (version is None or subject["version"] == version):
                 subject["eval_at"] = 0
+                subject.pop("deferred", None)
             self._save_subject(subject)
 
-    def defer_evaluation(self, account, gid, uid, until):
+    def defer_evaluation(self, account, gid, uid, until, reason="", code="deferred"):
         with self.db:
             subject = self.subject(account, gid, uid)
             subject["eval_at"] = until
+            subject["deferred"] = {"until": until, "reason": reason, "code": code}
             self._save_subject(subject)
+
+    def _clear_screening(self, subject, reason, now):
+        if subject.pop("screening", None):
+            self._audit(
+                now,
+                "免查缓存失效",
+                {
+                    "account": subject["account"],
+                    "group": subject["gid"],
+                    "user": subject["uid"],
+                    "reason": reason,
+                },
+            )
+        subject["cache_invalidated"] = reason
+
+    def cache_screening(self, account, gid, uid, version, record):
+        with self.db:
+            subject = self.subject(account, gid, uid)
+            if subject["version"] != version or subject.get("card_unconfirmed"):
+                return False
+            if record:
+                subject["screening"] = record
+                subject.pop("cache_invalidated", None)
+            else:
+                self._clear_screening(subject, "最新核验不再合规或豁免", subject["verified_at"])
+            self._save_subject(subject)
+            return True
+
+    def metric(self, account, gid, name, now, detail=None):
+        with self.db:
+            k = "stats:" + key(account, gid)
+            stats = self.get(k, {"since": now, "counts": {}, "last": {}})
+            stats["counts"][name] = stats["counts"].get(name, 0) + 1
+            stats["last"][name] = {"at": now, **(detail or {})}
+            self._set(k, stats)
+            return stats
+
+    def exemption_until(self, account, gid, uid):
+        row = self.db.execute(
+            "SELECT until FROM exemptions WHERE key=?", (key(account, gid, uid),)
+        ).fetchone()
+        return row[0] if row else 0
 
     def due(self, now, limit=40):
         cases = [
@@ -375,6 +429,9 @@ class Store:
     def remove_exempt(self, account, gid, uid, actor, now):
         with self.db:
             self.db.execute("DELETE FROM exemptions WHERE key=?", (key(account, gid, uid),))
+            subject = self.subject(account, gid, uid)
+            self._clear_screening(subject, "手动豁免变化", now)
+            self._save_subject(subject)
             self._audit(now, "取消豁免", {"account": account, "group": gid, "user": uid, "actor": actor})
 
     def new_case(self, subject, policy, platform, connection, round_no, minutes, now, due, max_pending=100):
@@ -435,6 +492,9 @@ class Store:
 
     def set_exempt(self, account, gid, uid, until, actor, now):
         with self.db:
+            subject = self.subject(account, gid, uid)
+            self._clear_screening(subject, "手动豁免变化", now)
+            self._save_subject(subject)
             self.db.execute(
                 "INSERT OR REPLACE INTO exemptions VALUES(?,?,?)", (key(account, gid, uid), until, actor)
             )
@@ -525,12 +585,56 @@ class Store:
             rows = self.db.execute("SELECT at FROM reads WHERE account=? ORDER BY at", (account,)).fetchall()
             available = int(limit * (0.65 if priority == 0 else 0.85 if priority == 1 else 1))
             if len(rows) >= available:
-                raise Later("资料读取已达预算，已安排稍后核对。", rows[0][0] + 3601)
+                raise Later(
+                    "资料读取已达预算，已安排稍后核对。",
+                    rows[len(rows) - available][0] + 3601,
+                    code="read_budget",
+                    used=len(rows),
+                    threshold=available,
+                    limit=limit,
+                    priority=priority,
+                )
             self.db.execute("INSERT INTO reads VALUES(?,?)", (account, now))
+
+    def read_status(self, account, now, limit):
+        rows = self.db.execute(
+            "SELECT at FROM reads WHERE account=? AND at>=? ORDER BY at", (account, now - 3600)
+        ).fetchall()
+        threshold = int(limit * 0.65)
+        return {
+            "used": len(rows),
+            "limit": limit,
+            "ordinary": threshold,
+            "resume_at": rows[len(rows) - threshold][0] + 3601 if len(rows) >= threshold else 0,
+        }
+
+    def refresh_read_deferrals(self, now, limit):
+        """A changed cap must not leave old budget waits sleeping until their former deadline."""
+        if self.get("read-limit") == limit:
+            return 0
+        changed = 0
+        with self.db:
+            self._set("read-limit", limit)
+            for row in self.db.execute("SELECT data FROM subjects WHERE eval_at>0").fetchall():
+                subject = json.loads(row[0])
+                if subject.get("deferred", {}).get("code") == "read_budget":
+                    subject["eval_at"] = now
+                    self._save_subject(subject)
+                    changed += 1
+            for row in self.db.execute(
+                "SELECT data FROM cases WHERE phase IN ('notify','ban','watch','settle')"
+            ).fetchall():
+                case = json.loads(row[0])
+                if case.get("read_defer_until", 0) > now:
+                    case["read_defer_until"] = 0
+                    case["due"] = now
+                    self._save_case(case)
+                    changed += 1
+        return changed
 
     def pending_count(self, account):
         return self.db.execute(
-            "SELECT count(*) FROM cases WHERE account=? AND phase IN ('notify','ban','watch','review','settle')",
+            "SELECT count(*) FROM (SELECT gid,uid FROM cases WHERE account=? AND phase IN ('notify','ban','watch','review','settle') GROUP BY gid,uid)",
             (account,),
         ).fetchone()[0]
 

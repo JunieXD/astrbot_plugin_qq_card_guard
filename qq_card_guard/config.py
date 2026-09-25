@@ -13,9 +13,10 @@ class GuardError(Exception):
 
 
 class Later(GuardError):
-    def __init__(self, message, until):
+    def __init__(self, message, until, *, code="deferred", **details):
         super().__init__(message)
         self.until = until
+        self.code, self.details = code, details
 
 
 MODES = ("仅观察", "只提醒", "提醒并禁言")
@@ -53,6 +54,8 @@ class Policy:
     reminder: str = DEFAULT_TEXT
     stages: tuple[Stage, ...] = (Stage(), Stage(10), Stage(60), Stage(360))
     bot_qq: str = ""
+    compliant_cache_minutes: int = 60
+    exempt_cache_minutes: int = 10
 
     @property
     def revision(self):
@@ -76,6 +79,13 @@ class Policy:
 
 
 @dataclass(frozen=True)
+class FollowupStep:
+    after_minutes: int
+    minimum: int
+    maximum: int
+
+
+@dataclass(frozen=True)
 class Pace:
     notify_min: int = 8
     notify_max: int = 20
@@ -87,8 +97,16 @@ class Pace:
     recall_max: int = 6
     gap_min: int = 3
     gap_max: int = 8
-    poll_min: int = 60
-    poll_max: int = 180
+    poll_min: int = 30
+    poll_max: int = 60
+    muted_poll_min: int = 20
+    muted_poll_max: int = 40
+    followup_steps: tuple[FollowupStep, ...] = (
+        FollowupStep(3, 60, 120),
+        FollowupStep(10, 180, 300),
+        FollowupStep(30, 600, 1200),
+        FollowupStep(120, 1800, 3600),
+    )
     startup_min: int = 30
     startup_max: int = 90
     recovery_min: int = 300
@@ -96,7 +114,7 @@ class Pace:
     group_hourly_reminders: int = 10
     account_hourly_reminders: int = 30
     account_daily_mutes: int = 30
-    reads_per_hour: int = 360
+    reads_per_hour: int = 600
     max_pending: int = 30
 
     def interval(self, action):
@@ -214,6 +232,8 @@ def parse_policy(raw):
         reminder=template(raw.get("reminder", DEFAULT_TEXT)),
         stages=tuple(parsed_stages),
         bot_qq=qq(more.get("bot_qq", ""), optional=True),
+        compliant_cache_minutes=integer(raw.get("compliant_cache_minutes", 60), "合规免查分钟", 0, 1440),
+        exempt_cache_minutes=integer(raw.get("exempt_cache_minutes", 10), "豁免免查分钟", 0, 1440),
     )
     if not policy.reminder.strip():
         raise GuardError("提醒内容不能是空白。")
@@ -255,11 +275,43 @@ def parse_settings(raw):
     }
     values = {}
     for key, default in asdict(Pace()).items():
+        if key == "followup_steps":
+            rows = raw.get(key, raw_pace.get(key, default))
+            if not isinstance(rows, list) and not isinstance(rows, tuple):
+                raise GuardError("后续补查阶梯应为列表。")
+            if not 1 <= len(rows) <= 8:
+                raise GuardError("后续补查阶梯应有1～8档。")
+            steps = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise GuardError("后续补查阶梯格式不正确。")
+                step = FollowupStep(
+                    integer(row.get("after_minutes"), "补查起始分钟", 1, 43200),
+                    integer(row.get("minimum"), "补查最短秒数", 30, 86400),
+                    integer(row.get("maximum"), "补查最长秒数", 30, 86400),
+                )
+                if step.minimum > step.maximum or (
+                    steps
+                    and (
+                        step.after_minutes <= steps[-1].after_minutes
+                        or step.minimum < steps[-1].minimum
+                        or step.maximum < steps[-1].maximum
+                    )
+                ):
+                    raise GuardError("补查阶梯的起始时间须递增，间隔须逐档不缩短，最短不能超过最长。")
+                steps.append(step)
+            values[key] = tuple(steps)
+            continue
         bounds = limits.get(key, (1, 3600) if key.startswith(("poll", "recovery")) else (0, 600))
         values[key] = integer(raw_pace.get(key, default), f"执行节奏 {key}", *bounds)
     pace = Pace(**values)
-    for kind in ("notify", "ban", "unmute", "recall", "gap", "poll", "startup", "recovery"):
+    for kind in ("notify", "ban", "unmute", "recall", "gap", "poll", "muted_poll", "startup", "recovery"):
         low, high = pace.interval(kind)
-        if low > high or (kind == "gap" and low < 1) or (kind == "poll" and low < 30):
+        if (
+            low > high
+            or (kind == "gap" and low < 1)
+            or (kind == "poll" and low < 30)
+            or (kind == "muted_poll" and low < 15)
+        ):
             raise GuardError("等待最小值不能大于最大值；操作间隔至少1秒，补查至少30秒。")
     return Settings(switch(raw, "enabled", False), tuple(groups), pace, tuple(errors))

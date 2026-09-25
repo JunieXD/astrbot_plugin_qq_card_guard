@@ -6,6 +6,7 @@ import asyncio
 import random
 import secrets
 import time
+from contextlib import asynccontextmanager
 
 from .config import GuardError, Later
 from .rules import Member, message_fingerprint, message_id, number
@@ -19,6 +20,7 @@ class Adapter:
         self.clock, self.sleep = clock, sleep
         self.account = ""
         self.lock = asyncio.Lock()
+        self.lock_owner = None
         self.session = secrets.token_hex(6)
         self.generation = 0
         self.objects = self.clients()
@@ -52,8 +54,22 @@ class Adapter:
             raise GuardError("机器人登录账号改变，请重载插件重新绑定。")
         return f"{self.session}:{self.generation}"
 
-    async def call(self, action, *, priority=0, before_send=None, **params):
+    @asynccontextmanager
+    async def preparation(self):
+        """Keep a write's fresh reads together, with cancellation-safe reentrancy."""
+        task = asyncio.current_task()
+        if self.lock_owner is task:
+            yield
+            return
         async with self.lock:
+            self.lock_owner = task
+            try:
+                yield
+            finally:
+                self.lock_owner = None
+
+    async def call(self, action, *, priority=0, before_send=None, **params):
+        async with self.preparation():
             try:
                 self.stamp()
                 quota_key = self.account or (self.token[0][0] if self.token else self.pid)
@@ -100,7 +116,7 @@ class Adapter:
 
     async def identity(self, force=False, priority=0):
         self.stamp()
-        if self.account and not force and self.clock() - self.identity_at < 60:
+        if self.account and not force and self.clock() - self.identity_at < 300:
             return self.account
         data = await self.call("get_login_info", priority=priority)
         if not isinstance(data, dict) or not number(data.get("user_id")):
@@ -185,6 +201,23 @@ class Router:
         self.context, self.store, self.pace, self.journal = context, store, pace, journal
         self.adapters = {}
         self.lock = asyncio.Lock()
+
+    def known_stamp(self, pid, account):
+        """A cache lookup must not query QQ, nor trust a replaced/disconnected adapter."""
+        adapter = self.adapters.get(pid)
+        if adapter is None or adapter.account != account:
+            return None
+        platforms = [p for p in self.context.platform_manager.get_insts() if p.meta().name == "aiocqhttp"]
+        if not any(str(p.meta().id) == pid and getattr(p, "bot", None) is adapter.bot for p in platforms):
+            return None
+        identities = []
+        for platform in platforms:
+            clients = getattr(getattr(platform, "bot", None), "_wsr_api_clients", None)
+            if isinstance(clients, dict):
+                identities.extend(str(a) for a in clients)
+        if len(identities) != len(set(identities)):
+            return None
+        return adapter.stamp()
 
     async def resolve(self, policy, *, expected=None, priority=0):
         async with self.lock:

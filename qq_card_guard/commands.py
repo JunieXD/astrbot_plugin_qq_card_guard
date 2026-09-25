@@ -55,6 +55,11 @@ def describe(case):
         f"{case['id']} · QQ {case['uid']} · 第{case['round']}轮 · {PHASES[case['phase']]}\n"
         f"禁言：{MUTES[case['mute_state']]}；提醒：{RECALLS[case['recall_state']]}\n"
         f"{case['reason']}"
+        + (
+            f"\n下次处理：{when(case['due'])}"
+            if case["phase"] in ("notify", "ban", "watch", "settle")
+            else ""
+        )
     )
 
 
@@ -90,12 +95,22 @@ class Commands:
             pause = await self.db.call("get", "pause:" + key(a, g), "")
             pending = await self.db.call("pending_cases", a, g, 101)
             errors = self.s.group_errors.get(g)
+            budget = await self.db.call(
+                "read_status", a, self.s.clock(), self.s.settings().pace.reads_per_hour
+            )
+            stats = await self.db.call("get", "stats:" + key(a, g), {"counts": {}})
+            counts = stats["counts"]
             return (
                 f"群 {g} · {policy.mode}\n"
                 f"新增处理：{'已开启' if self.s.settings().enabled and policy.enabled else '已关闭'}"
                 f"；暂停：{'是' if pause or block else '否'}\n"
                 f"格式：{policy.format_help}；示例：{policy.example}\n"
                 f"待处理：{len(pending)}；阶梯禁言分钟：{' → '.join(str(x.minutes) for x in policy.stages)}\n"
+                f"免查：合规{policy.compliant_cache_minutes}分钟 / 豁免{policy.exempt_cache_minutes}分钟\n"
+                f"账号最近60分钟查询：{budget['used']}/{budget['limit']}；普通检查门槛{budget['ordinary']}\n"
+                f"普通查询恢复：{when(budget['resume_at']) if budget['resume_at'] else '当前可用'}\n"
+                f"累计：缓存跳过{counts.get('cache_hit', 0)}，合并{counts.get('merged', 0)}，"
+                f"暂缓{counts.get('deferred', 0)}，过时发言跳过{counts.get('expired', 0)}\n"
                 f"运行异常：{self.s.failure or (errors[1] if errors and errors[0] == policy.revision else '无')}\n"
                 f"账号待核对：{'有（请查看待处理，接手后恢复）' if block else '无'}"
             )

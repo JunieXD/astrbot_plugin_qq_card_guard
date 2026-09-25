@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import random
+from contextlib import nullcontext
 
 from .config import GuardError, Later
 from .rules import message_fingerprint
+from .scheduling import followup_window
 from .store import key
 
 
@@ -24,9 +26,23 @@ class Executor:
 
     async def poll(self, case, **changes):
         count = case["polls"] + 1
-        # Old outstanding reminders must not monopolize the member-info budget.
-        factor = min(10, 1 + int((self.now() - case["created"]) / 3600))
-        return await self.patch(case, due=self.now() + self.delay("poll") * factor, polls=count, **changes)
+        planned = {**case, **changes}
+        stage, low, high = followup_window(planned, self.s.settings().pace, self.now())
+        due = self.now() + random.uniform(low, high)
+        result = await self.patch(case, due=due, polls=count, **changes)
+        self.s.journal.record(
+            "安排补查",
+            account=case["account"],
+            group=case["gid"],
+            user=case["uid"],
+            case=case["id"],
+            stage=stage,
+            due=due,
+            minimum=low,
+            maximum=high,
+            reason=changes.get("reason", "等待名片修改"),
+        )
+        return result
 
     def versions(self, case):
         a, g, u = case["account"], case["gid"], case["uid"]
@@ -135,7 +151,8 @@ class Executor:
         if case["phase"] == "review":
             # Unknown writes are never inferred from an unrelated later membership/card change.
             return
-        member, subject, verdict = await self.inspect_case(case, adapter)
+        urgent = case["mute_state"] in ("owned", "unverified") and case["mute_until"] > self.now()
+        member, subject, verdict = await self.inspect_case(case, adapter, priority=2 if urgent else 1)
         state = await self.ownership(case, member, subject)
         if member is None:
             await self.patch(
@@ -167,7 +184,10 @@ class Executor:
                 try:
                     # Shared queue waits may be arbitrarily long. All facts are read afterwards.
                     await self.gate(case, adapter, new)
-                    return await self.attempt(case, adapter, phase)
+                    # Acquire the read lock before measuring freshness. Other members' reads
+                    # cannot repeatedly age this preparation out while it is in progress.
+                    async with adapter.preparation() if hasattr(adapter, "preparation") else nullcontext():
+                        return await self.attempt(case, adapter, phase)
                 except GuardError as exc:
                     if guard:
                         raise guard.deferred_error(str(exc)) from exc
@@ -199,7 +219,12 @@ class Executor:
                 )
             except guard.deferred_error as exc:
                 cause = exc.__cause__
-                raise Later(str(exc), getattr(cause, "until", self.now() + 60)) from exc
+                raise Later(
+                    str(exc),
+                    getattr(cause, "until", self.now() + 60),
+                    code=getattr(cause, "code", "deferred"),
+                    **getattr(cause, "details", {}),
+                ) from exc
         else:
             if not await online():
                 raise Later("QQ当前离线，等待连接恢复。", self.now() + 300)
@@ -335,7 +360,12 @@ class Executor:
             nonlocal sent
             self.s.healthy()
             if adapter.stamp() != stamp or self.versions(case) != versions or self.now() - prepared_at > 20:
-                raise Later("提交前资料或连接变化，已取消本次发送。", self.now() + 5)
+                raise Later(
+                    "提交前资料或连接变化，已取消本次发送。",
+                    self.now() + 5,
+                    code="stale_preparation",
+                    age_seconds=round(self.now() - prepared_at, 3),
+                )
             try:
                 current = self.s.settings().group(case["gid"]) if new else self.s.policy(case)
             except GuardError as exc:
@@ -406,7 +436,7 @@ class Executor:
                         mute_until=at + seconds,
                         next_round=max(case["next_round"], at + seconds),
                         mute_state="unverified",
-                        due=self.now() + self.delay("poll"),
+                        due=self.now() + self.delay("muted_poll"),
                         reason="禁言接口成功，等待归属核验",
                     )
                 else:

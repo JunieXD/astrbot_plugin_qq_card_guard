@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+from contextvars import ContextVar
 from dataclasses import replace
 
 from .config import GuardError, Later, Policy, Stage, fingerprint
 from .rules import judge, number
+from .scheduling import cache_check
 from .store import key
 
 
@@ -47,6 +49,7 @@ class Service:
         self.last_clock = (clock(), monotonic())
         self.command_until = {}
         self.wake = asyncio.Event()
+        self.inspections = ContextVar(f"card-guard-inspections-{id(self)}", default=None)
 
     def member_lock(self, a, g, u):
         return self.member_locks.setdefault(key(a, g, u), asyncio.Lock())
@@ -187,20 +190,34 @@ class Service:
             ]
         )
         enabled = self.settings().enabled and policy.enabled and now - at <= 120
-        await self.store.call("observe", event, now, enabled)
+        result = await self.store.call("observe", event, now, enabled)
+        if result and result.get("cache_invalidated"):
+            self.journal.record(
+                "免查缓存失效", account=a, group=g, user=u, reason=result["cache_invalidated"], source=kind
+            )
         self.journal.record("成员事件", account=a, group=g, user=u, event_type=kind, occurred=at)
         self.wake.set()
 
     async def inspect(self, policy, adapter, uid, *, stable=False, priority=0):
         a, g = adapter.account, policy.group_id
         version = self.version(a, g, uid)
+        connection = adapter.stamp()
+        memo = self.inspections.get()
+        memo_key = (a, g, uid, policy.revision, connection, version)
+        cached = memo.get(memo_key) if memo is not None and not stable else None
+        if cached and 0 <= self.clock() - cached[0] < 10:
+            subject = await self.store.call("subject", a, g, uid)
+            if subject["epoch"] == cached[2]["epoch"] and subject["version"] == cached[2]["version"]:
+                self.journal.record("合并资料核验", account=a, group=g, user=uid)
+                await self.store.call("metric", a, g, "merged", self.clock())
+                return cached[1:]
         first = await adapter.member(g, uid, priority)
         hint = await self.store.call("subject", a, g, uid)
         reconcile_role = (
             hint["role_hint"] == "admin" and hint["role_at"] < self.clock() - 300 and first.role == "member"
         )
         second = await adapter.member(g, uid, priority) if stable or reconcile_role else first
-        if version != self.version(a, g, uid):
+        if version != self.version(a, g, uid) or adapter.stamp() != connection:
             raise Later("核验期间资料变化，稍后重新核验。", self.clock() + 5)
         if first.card != second.card or first.joined != second.joined:
             raise Later("成员资料缓存尚未一致，稍后核验。", self.clock() + 15)
@@ -246,14 +263,79 @@ class Service:
             group=g,
             user=uid,
             card=member.card,
-            level=member.level,
+            member_level=member.level,
             title=member.title,
             decision=verdict.state,
             reason=verdict.reason,
             revision=policy.revision,
             epoch=subject["epoch"],
         )
+        await self.store.call("metric", a, g, "inspected", self.clock())
+        record = None
+        if verdict.state in ("compliant", "exempt"):
+            record = {
+                "at": self.clock(),
+                "decision": verdict.state,
+                "reason": verdict.reason,
+                "revision": policy.revision,
+                "connection": connection,
+                "epoch": subject["epoch"],
+                "exemption_until": await self.store.call("exemption_until", a, g, uid) if manual else 0,
+            }
+        await self.store.call("cache_screening", a, g, uid, subject["version"], record)
+        if memo is not None:
+            memo[memo_key] = (self.clock(), member, subject, verdict)
         return member, subject, verdict
+
+    async def skip_evaluation(self, subject, reason, metric, **details):
+        a, g, u = subject["account"], subject["gid"], subject["uid"]
+        await self.store.call("evaluated", a, g, u, subject["speech_at"], subject["version"])
+        await self.store.call("metric", a, g, metric, self.clock(), {"reason": reason})
+        self.journal.record(
+            "发言检查跳过", account=a, group=g, user=u, reason=reason, category=metric, **details
+        )
+
+    async def preflight(self, subject, policy, connection):
+        """Skip work before even resolving identity; never skip unfinished relief."""
+        a, g, u = subject["account"], subject["gid"], subject["uid"]
+        if not self.settings().enabled or not policy.enabled or not subject["eval_at"]:
+            await self.store.call("evaluated", a, g, u, subject["speech_at"], subject["version"])
+            return True
+        if self.clock() - subject["speech_at"] > 300:
+            await self.skip_evaluation(
+                subject,
+                "发言超过5分钟，等待新的发言",
+                "expired",
+                speech_at=subject["speech_at"],
+                deferred=subject.get("deferred"),
+            )
+            return True
+        cases = await self.store.call("member_cases", a, g, u)
+        active = [c for c in cases if c["phase"] in ("notify", "ban", "watch", "review", "settle")]
+        if active:
+            if not subject.get("card_unconfirmed") and any(
+                c["phase"] != "watch"
+                or self.clock() < c["next_round"]
+                or subject["speech_at"] < c["next_round"]
+                for c in active
+            ):
+                await self.skip_evaluation(subject, "由已有事项继续跟进，合并重复发言检查", "merged")
+                return True
+            return False
+        cached, reason = cache_check(subject, policy, connection, self.clock())
+        if cached:
+            await self.skip_evaluation(
+                subject,
+                cached["reason"],
+                "cache_hit",
+                decision=cached["decision"],
+                verified_at=cached["at"],
+                valid_until=cached["until"],
+            )
+            return True
+        if subject.get("screening"):
+            self.journal.record("免查缓存失效", account=a, group=g, user=u, reason=reason)
+        return False
 
     async def authorize(self, policy, actor, pid, account):
         adapter = await self.router.resolve(policy, expected=(pid, account), priority=2)
@@ -283,13 +365,7 @@ class Service:
         a, g, u = subject["account"], subject["gid"], subject["uid"]
         settings = self.settings()
         policy = settings.group(g)
-        if (
-            not settings.enabled
-            or not policy.enabled
-            or not subject["eval_at"]
-            or self.clock() - subject["speech_at"] > 300
-        ):
-            await self.store.call("evaluated", a, g, u, subject["speech_at"])
+        if await self.preflight(subject, policy, adapter.stamp()):
             return
         if key(a, g) in self.paused or await self.store.call("get", "pause:" + key(a, g), ""):
             raise Later("本群已暂停新增提醒。", self.clock() + 300)
@@ -348,7 +424,7 @@ class Service:
             self.journal.record(
                 "安排提醒", case=case["id"], account=a, group=g, user=u, round=round_no, due=case["due"]
             )
-        await self.store.call("evaluated", a, g, u, subject["speech_at"])
+        await self.store.call("evaluated", a, g, u, subject["speech_at"], subject["version"])
 
     async def settle_member(self, a, g, u, reason):
         for case in await self.store.call("member_cases", a, g, u):
@@ -396,32 +472,94 @@ class Service:
 
         a, g, u = item["account"], item["gid"], item["uid"]
         policy = None
+        token = self.inspections.set({})
         try:
             async with self.member_lock(a, g, u):
                 policy = self.policy(item) if kind == "case" else self.settings().group(g)
+                if kind == "subject":
+                    subject = await self.store.call("subject", a, g, u)
+                    known = getattr(self.router, "known_stamp", lambda *_: None)(item["platform"], a)
+                    if await self.preflight(subject, policy, known):
+                        return
+                urgent = (
+                    kind == "case"
+                    and item["mute_state"] in ("owned", "unverified")
+                    and item["mute_until"] > self.clock()
+                )
                 adapter = await self.router.resolve(
                     policy,
                     expected=(item["platform"], a),
-                    priority=(2 if item["phase"] == "settle" else 1 if item["phase"] == "watch" else 0)
+                    priority=(
+                        2 if item["phase"] == "settle" or urgent else 1 if item["phase"] == "watch" else 0
+                    )
                     if kind == "case"
                     else 0,
                 )
                 if kind == "case":
                     await Executor(self).process(await self.store.call("case", item["id"]), adapter)
+                    if item["phase"] == "watch":
+                        subject = await self.store.call("subject", a, g, u)
+                        if subject["eval_at"] and subject["eval_at"] <= self.clock():
+                            try:
+                                await self.evaluate(subject, adapter)
+                            except Later as exc:
+                                await self.store.call(
+                                    "defer_evaluation", a, g, u, exc.until, str(exc), exc.code
+                                )
+                                await self.store.call(
+                                    "metric",
+                                    a,
+                                    g,
+                                    "deferred",
+                                    self.clock(),
+                                    {"reason": str(exc), "until": exc.until, "code": exc.code},
+                                )
+                                self.journal.record(
+                                    "发言检查暂缓",
+                                    account=a,
+                                    group=g,
+                                    user=u,
+                                    exception=exc,
+                                    retry_at=exc.until,
+                                    code=exc.code,
+                                    limits=exc.details,
+                                )
                 else:
                     await self.evaluate(await self.store.call("subject", a, g, u), adapter)
         except GuardError as exc:
             until = getattr(exc, "until", self.clock() + 300)
-            self.journal.record("处理暂缓", account=a, group=g, user=u, exception=exc, retry_at=until)
+            self.journal.record(
+                "处理暂缓",
+                account=a,
+                group=g,
+                user=u,
+                exception=exc,
+                retry_at=until,
+                code=getattr(exc, "code", "deferred"),
+                limits=getattr(exc, "details", {}),
+            )
             if "正则" in str(exc) and policy:
                 self.group_errors[g] = (policy.revision, str(exc))
             try:
+                await self.store.call(
+                    "metric",
+                    a,
+                    g,
+                    "deferred",
+                    self.clock(),
+                    {"reason": str(exc), "until": until, "code": getattr(exc, "code", "deferred")},
+                )
                 if kind == "case":
-                    await self.store.call("patch_case", item["id"], {"due": until, "reason": str(exc)})
+                    changes = {"due": until, "reason": str(exc)}
+                    if getattr(exc, "code", "") == "read_budget":
+                        changes["read_defer_until"] = until
+                    await self.store.call("patch_case", item["id"], changes)
                 elif policy is None:
                     await self.store.call("evaluated", a, g, u, item["speech_at"])
                 else:
-                    await self.store.call("defer_evaluation", a, g, u, until)
+                    await self.store.call(
+                        "defer_evaluation", a, g, u, until, str(exc), getattr(exc, "code", "deferred")
+                    )
             except GuardError:
                 self.failure = "无法保存待处理状态，已停止操作，请检查日志后重载。"
         except asyncio.CancelledError:
@@ -430,10 +568,18 @@ class Service:
             self.failure = "发生内部异常，已停止自动操作，请查看日志后重载。"
             self.journal.record("任务异常", exception=exc, account=a, group=g, user=u)
         finally:
+            self.inspections.reset(token)
             self.running.discard(key(a, g, u))
 
     async def tick(self):
         self.healthy()
+        adjusted = await self.store.call(
+            "refresh_read_deferrals", self.clock(), self.settings().pace.reads_per_hour
+        )
+        if adjusted:
+            self.journal.record(
+                "读取额度调整后重新调度", resumed=adjusted, limit=self.settings().pace.reads_per_hour
+            )
         cases, subjects = await self.store.call("due", self.clock())
         for kind, item in [("case", c) for c in cases] + [("subject", s) for s in subjects]:
             k = key(item["account"], item["gid"], item["uid"])

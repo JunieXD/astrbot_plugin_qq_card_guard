@@ -166,14 +166,17 @@ class Journal:
         if exception is not None:
             level = "WARNING" if isinstance(exception, (GuardError, asyncio.CancelledError)) else "ERROR"
             fields["exception"] = exception_detail(exception)
+        # Business fields must never overwrite severity or the event identity.
+        context = {**_LOG_CONTEXT.get(), **fields}
+        if "level" in context:
+            context["member_level"] = context.pop("level")
         payload = {
+            **context,
             "at": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="milliseconds"),
             "level": level,
             "session": self.session,
-            **_LOG_CONTEXT.get(),
             "event": kind,
             "detail": detail,
-            **fields,
         }
 
         # Redact string values before encoding so untrusted newlines cannot forge log records.

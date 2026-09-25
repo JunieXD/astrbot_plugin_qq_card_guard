@@ -121,5 +121,6 @@ def test_schema_defaults_are_valid_and_cover_settings():
     settings = parse_settings(raw)
     assert not settings.errors and not settings.enabled
     assert asdict(settings.group(G)) == asdict(Policy(G))
-    assert set(schema["pace"]["items"]) == set(asdict(settings.pace))
+    assert set(schema["pace"]["items"]) | {"followup_steps"} == set(asdict(settings.pace))
+    assert schema["followup_steps"]["type"] == "template_list"
     assert all(v["type"] != "template_list" for v in schema["groups"]["templates"]["group"]["items"].values())
