@@ -251,13 +251,13 @@
         "hint": "不能小于对应最短值；每次独立抽取随机值。"
       },
       "ban_min": {
-        "description": "提醒成功后到禁言之间等待最短秒数",
+        "description": "提醒成功后开始禁言核验的最短等待秒数",
         "type": "int",
         "default": 3,
-        "hint": "期间再次核验；提醒失败不会禁言。"
+        "hint": "到时重新核验名片、豁免和禁言状态；实际禁言还需操作间隔、队列及核验耗时。提醒失败不会禁言。"
       },
       "ban_max": {
-        "description": "提醒成功后到禁言之间等待最长秒数",
+        "description": "提醒成功后开始禁言核验的最长等待秒数",
         "type": "int",
         "default": 8,
         "hint": "不能小于对应最短值；每次独立抽取随机值。"
@@ -289,14 +289,26 @@
       "gap_min": {
         "description": "同一账号两次写操作之间间隔最短秒数",
         "type": "int",
-        "default": 3,
+        "default": 1,
         "hint": "所有群共用，最短至少1秒；兼容已有QQ自动化共享队列时可能额外等待。"
       },
       "gap_max": {
         "description": "同一账号两次写操作之间间隔最长秒数",
         "type": "int",
-        "default": 8,
+        "default": 2,
         "hint": "不能小于对应最短值；每次独立抽取随机值。"
+      },
+      "read_min": {
+        "description": "连续资料读取的最短间隔秒数",
+        "type": "int",
+        "default": 1,
+        "hint": "同一账号共用，至少1秒；按两次读取开始时间间隔控制，仍受每小时读取上限约束。"
+      },
+      "read_max": {
+        "description": "连续资料读取的最长间隔秒数",
+        "type": "int",
+        "default": 2,
+        "hint": "不能小于最短值；每次随机取值。数值越大，提交前核验越慢。"
       },
       "poll_min": {
         "description": "提醒初期补查最短秒数",

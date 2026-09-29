@@ -12,6 +12,7 @@ from aiocqhttp.exceptions import ActionFailed
 
 from .config import ApiFailure, GuardError, Later
 from .rules import Member, message_fingerprint, message_id, number
+from .timing import api_timing
 
 WRITES = {"send_group_msg", "set_group_ban", "delete_msg"}
 
@@ -79,8 +80,9 @@ class Adapter:
                     await self.store.call(
                         "reserve_read", quota_key, self.clock(), self.pace().reads_per_hour, priority
                     )
-                    await self.sleep(max(0, self.next_read - self.clock()))
-                    self.next_read = self.clock() + random.uniform(1.5, 3)
+                    with api_timing("read_wait"):
+                        await self.sleep(max(0, self.next_read - self.clock()))
+                    self.next_read = self.clock() + random.uniform(*self.pace().interval("read"))
 
                 async def invoke():
                     self.stamp()
@@ -90,7 +92,10 @@ class Adapter:
                         before_send()
                     return await self.bot.call_action(action=action, **params)
 
-                with self.journal.span("平台接口", api=action, account=self.account, platform=self.pid):
+                with (
+                    api_timing("api:" + action),
+                    self.journal.span("平台接口", api=action, account=self.account, platform=self.pid),
+                ):
                     try:
                         result = await asyncio.wait_for(asyncio.create_task(invoke()), timeout=25)
                     except GuardError:
@@ -118,17 +123,25 @@ class Adapter:
                         "extend", "connection:" + self.pid, self.recovery_until
                     )
 
-    async def identity(self, force=False, priority=0):
-        self.stamp()
-        if self.account and not force and self.clock() - self.identity_at < 300:
+    async def identity(self, force=False, priority=0, max_age=300):
+        stamp = self.stamp()
+        age = self.clock() - self.identity_at
+        # Short write-time reuse requires a live WebSocket bound to this exact account.
+        bound = bool(self.token) and self.token[0][0] == self.account
+        if self.account and self.identity_at and not force and 0 <= age < max_age and (max_age > 10 or bound):
+            if max_age <= 10:
+                self.journal.record("核验结果复用", api="get_login_info", age_seconds=round(age, 3))
             return self.account
+        started = self.clock()
         data = await self.call("get_login_info", priority=priority)
+        if self.stamp() != stamp:
+            raise Later("身份核验期间连接变化，稍后重新核验。", self.clock() + 5)
         if not isinstance(data, dict) or not number(data.get("user_id")):
             raise GuardError("无法确认机器人身份。")
         account = str(data["user_id"])
         if self.account and self.account != account:
             raise GuardError("机器人账号改变，请重载插件。")
-        self.account, self.identity_at = account, self.clock()
+        self.account, self.identity_at = account, started
         self.recovery_until = max(
             self.recovery_until, await self.store.call("get", "connection:" + self.pid, 0)
         )

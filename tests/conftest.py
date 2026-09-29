@@ -69,7 +69,7 @@ class FakeAdapter:
     def stamp(self):
         return self.binding
 
-    async def identity(self, force=False, priority=0):
+    async def identity(self, force=False, priority=0, max_age=300):
         return self.account
 
     async def online(self, priority=2):

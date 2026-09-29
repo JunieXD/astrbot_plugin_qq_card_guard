@@ -128,8 +128,10 @@ class Pace:
     unmute_max: int = 3
     recall_min: int = 2
     recall_max: int = 6
-    gap_min: int = 3
-    gap_max: int = 8
+    gap_min: int = 1
+    gap_max: int = 2
+    read_min: int = 1
+    read_max: int = 2
     poll_min: int = 30
     poll_max: int = 60
     muted_poll_min: int = 20
@@ -338,13 +340,24 @@ def parse_settings(raw):
         bounds = limits.get(key, (1, 3600) if key.startswith(("poll", "recovery")) else (0, 600))
         values[key] = integer(raw_pace.get(key, default), f"执行节奏 {key}", *bounds)
     pace = Pace(**values)
-    for kind in ("notify", "ban", "unmute", "recall", "gap", "poll", "muted_poll", "startup", "recovery"):
+    for kind in (
+        "notify",
+        "ban",
+        "unmute",
+        "recall",
+        "gap",
+        "read",
+        "poll",
+        "muted_poll",
+        "startup",
+        "recovery",
+    ):
         low, high = pace.interval(kind)
         if (
             low > high
-            or (kind == "gap" and low < 1)
+            or (kind in ("gap", "read") and low < 1)
             or (kind == "poll" and low < 30)
             or (kind == "muted_poll" and low < 15)
         ):
-            raise GuardError("等待最小值不能大于最大值；操作间隔至少1秒，补查至少30秒。")
+            raise GuardError("等待最小值不能大于最大值；操作间隔和读取间隔至少1秒，补查至少30秒。")
     return Settings(switch(raw, "enabled", False), tuple(groups), pace, tuple(errors))

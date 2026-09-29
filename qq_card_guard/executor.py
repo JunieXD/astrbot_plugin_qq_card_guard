@@ -10,6 +10,7 @@ from .config import GuardError, Later
 from .rules import message_fingerprint
 from .scheduling import followup_window
 from .store import key
+from .timing import ActionTiming
 
 
 class Executor:
@@ -185,33 +186,64 @@ class Executor:
             raise Later("机器人当前没有可确认的群管理权限。", self.now() + 300)
 
     async def write(self, case, adapter, phase):
+        with ActionTiming(self.s, case, phase).trace() as timing:
+            await self._write(case, adapter, phase, timing)
+
+    async def _write(self, case, adapter, phase, timing):
         lock = self.s.account_locks.setdefault(adapter.account, asyncio.Lock())
         new = phase in ("notify", "ban")
-        await self.gate(case, adapter, new)
+        with timing.stage("gate"):
+            await self.gate(case, adapter, new)
         guard = self.s.router.shared_guard()
+        queue_started = None
+        online_result = None
+
+        def finish_queue_wait():
+            nonlocal queue_started
+            if queue_started is not None:
+                # Online checks are measured separately; do not double-count them as queueing.
+                timing.add("queue_wait", timing.clock() - queue_started - timing.stages.get("online", 0))
+                queue_started = None
 
         async def attempt():
-            async with lock:
+            finish_queue_wait()
+            async with timing.waiting(lock, "account_lock"):
                 try:
                     # Shared queue waits may be arbitrarily long. All facts are read afterwards.
-                    await self.gate(case, adapter, new)
+                    with timing.stage("gate"):
+                        await self.gate(case, adapter, new)
                     # Acquire the read lock before measuring freshness. Other members' reads
                     # cannot repeatedly age this preparation out while it is in progress.
-                    async with adapter.preparation() if hasattr(adapter, "preparation") else nullcontext():
-                        return await self.attempt(case, adapter, phase)
+                    preparation = adapter.preparation() if hasattr(adapter, "preparation") else nullcontext()
+                    async with timing.waiting(preparation, "read_lock"):
+                        return await self.attempt(case, adapter, phase, timing)
                 except GuardError as exc:
                     if guard:
                         raise guard.deferred_error(str(exc)) from exc
                     raise
 
         async def online():
-            return await adapter.online(priority=0 if new else 2)
+            nonlocal online_result
+            with timing.stage("online"):
+                stamp, started = adapter.stamp(), timing.clock()
+                if online_result and online_result[0] == stamp and 0 <= started - online_result[1] < 3:
+                    self.s.journal.record(
+                        "核验结果复用", api="get_status", age_seconds=round(started - online_result[1], 3)
+                    )
+                    return True
+                online_result = None
+                connected = await adapter.online(priority=0 if new else 2)
+                if connected and adapter.stamp() == stamp:
+                    online_result = (stamp, started)
+                    return True
+                return False
 
         if guard:
             pace = self.s.settings().pace
             options = {}
             if getattr(guard, "scheduling_version", 1) >= 3:
                 options = dict(priority=2 if new else 1, group=case["gid"], label="名片规范")
+            queue_started = timing.clock()
             try:
                 await guard.run(
                     account=adapter.pid,
@@ -236,12 +268,14 @@ class Executor:
                     code=getattr(cause, "code", "deferred"),
                     **getattr(cause, "details", {}),
                 ) from exc
+            finally:
+                finish_queue_wait()
         else:
             if not await online():
                 raise Later("QQ当前离线，等待连接恢复。", self.now() + 300)
             await attempt()
 
-    async def attempt(self, case, adapter, phase):
+    async def attempt(self, case, adapter, phase, timing):
         new = phase in ("notify", "ban")
         try:
             policy = self.s.settings().group(case["gid"]) if new else self.s.policy(case)
@@ -282,14 +316,18 @@ class Executor:
         versions = self.versions(case)
         stamp = adapter.stamp()
         prepared_at = self.now()
-        if await adapter.identity(force=True, priority=0 if new else 2) != case["account"]:
-            raise GuardError("提交前机器人身份改变，请重新核对账号绑定。")
-        await self.bot_permission(case, adapter, 0 if new else 2)
-        if new and await adapter.all_muted(case["gid"]):
-            raise Later("全员禁言期间暂停新增处理。", self.now() + 300)
-        member, subject, verdict = await self.inspect_case(
-            case, adapter, stable=True, priority=0 if new else 2
-        )
+        with timing.stage("identity"):
+            if await adapter.identity(max_age=10, priority=0 if new else 2) != case["account"]:
+                raise GuardError("提交前机器人身份改变，请重新核对账号绑定。")
+        with timing.stage("bot_permission"):
+            await self.bot_permission(case, adapter, 0 if new else 2)
+        with timing.stage("group_state"):
+            if new and await adapter.all_muted(case["gid"]):
+                raise Later("全员禁言期间暂停新增处理。", self.now() + 300)
+        with timing.stage("member_checks"):
+            member, subject, verdict = await self.inspect_case(
+                case, adapter, stable=True, priority=0 if new else 2
+            )
         if new and (member is None or verdict.state in ("compliant", "exempt")):
             await self.patch(
                 case,
@@ -317,7 +355,8 @@ class Executor:
             if member and verdict.state not in ("compliant", "exempt"):
                 await self.poll(case, phase="watch", reason="名片再次不合规，保留现有处理")
                 return
-            mute_state = await self.ownership(case, member, subject)
+            with timing.stage("mute_ownership"):
+                mute_state = await self.ownership(case, member, subject)
             case = await self.patch(case, mute_state=mute_state)
             if mute_state in ("owned", "unverified") and policy.unmute_on_compliance:
                 if mute_state != "owned":
@@ -340,7 +379,8 @@ class Executor:
                     await self.patch(case, phase="closed", reason=case["reason"] or "已完成核验")
                     return
                 try:
-                    await adapter.locate_message(case)
+                    with timing.stage("message_lookup"):
+                        await adapter.locate_message(case)
                 except Later:
                     raise
                 except GuardError as exc:
@@ -396,7 +436,8 @@ class Executor:
 
         pace = self.s.settings().pace
         try:
-            oid = await self.db.call("reserve", case, kind, self.now(), payload, policy, pace)
+            with timing.stage("persistence"):
+                oid = await self.db.call("reserve", case, kind, self.now(), payload, policy, pace)
         except asyncio.CancelledError:
             reserved = await self.db.call("has_operation", case["id"], kind)
             if reserved and reserved["status"] == "submitted":
@@ -413,8 +454,11 @@ class Executor:
             await self.db.call("extend", "gap:" + adapter.account, self.now() + gap)
             at = self.now()
             if kind == "notify":
-                result = await adapter.notify(case["gid"], message, fence)
-                due = self.now() + self.delay("ban" if case["minutes"] else "poll")
+                with timing.stage("submit"):
+                    result = await adapter.notify(case["gid"], message, fence)
+                completed_at = self.now()
+                delay = self.delay("ban" if case["minutes"] else "poll")
+                due = completed_at + delay
                 next_round = (
                     at
                     + max(
@@ -428,6 +472,8 @@ class Executor:
                     message_id=result,
                     message_hash=message_fingerprint(message),
                     sent_at=at,
+                    notify_completed_at=completed_at,
+                    ban_delay_seconds=delay if case["minutes"] else 0,
                     recall_state="pending",
                     next_round=next_round,
                     phase="ban" if case["minutes"] else "watch",
@@ -438,7 +484,8 @@ class Executor:
                 )
             elif kind in ("ban", "unmute"):
                 seconds = case["minutes"] * 60 if kind == "ban" else 0
-                result = await adapter.ban(case["gid"], case["uid"], seconds, fence)
+                with timing.stage("submit"):
+                    result = await adapter.ban(case["gid"], case["uid"], seconds, fence)
                 if kind == "ban":
                     changes = dict(
                         phase="watch",
@@ -458,9 +505,12 @@ class Executor:
                         reason="已核验解除本插件禁言",
                     )
             else:
-                result = await adapter.recall(case["message_id"], fence)
+                with timing.stage("submit"):
+                    result = await adapter.recall(case["message_id"], fence)
                 changes = dict(phase="closed", recall_state="recalled", reason="已撤回提醒")
-            await self.db.call("finish", oid, "confirmed", {"accepted": True}, changes, self.now())
+            with timing.stage("persistence"):
+                await self.db.call("finish", oid, "confirmed", {"accepted": True}, changes, self.now())
+            timing.outcome = "confirmed"
             self.s.journal.record(
                 "操作完成",
                 case=case["id"],
@@ -480,6 +530,7 @@ class Executor:
             # The request may have reached QQ. A timeout or cancellation is not a failed effect.
             changes = self.uncertain_changes(kind, "操作返回异常或中断，结果需要核对")
             await self.db.call("finish", oid, "unknown", {"needs_review": True}, changes, self.now())
+            timing.outcome = "uncertain"
             if new:
                 await self.block(case)
             self.s.journal.record("操作结果不明", case=case["id"], action=kind, exception=exc)

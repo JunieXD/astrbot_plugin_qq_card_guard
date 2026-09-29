@@ -275,8 +275,9 @@ async def test_old_case_update_does_not_reorder_history(env):
 async def test_account_is_reconfirmed_before_each_effect(env):
     case = await env.speak()
 
-    async def switched_identity(force=False, priority=0):
-        return "900001" if force else A
+    async def switched_identity(force=False, priority=0, max_age=300):
+        assert max_age == 10
+        return "900001"
 
     env.adapter.identity = switched_identity
     with pytest.raises(GuardError, match="身份改变"):
