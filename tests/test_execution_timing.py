@@ -214,7 +214,7 @@ class PipelineBot(Bot):
         self.env = env
 
     async def call_action(self, action, **params):
-        self.calls.append({"action": action, **params})
+        self.calls.append({"action": action, "at": self.env.clock(), **params})
         await self.env.clock.sleep(0.2)
         if action == "get_login_info":
             return {"user_id": A}
@@ -240,7 +240,8 @@ class PipelineBot(Bot):
         raise AssertionError(action)
 
 
-async def test_reminder_to_ban_pipeline_is_faster_and_keeps_fresh_member_checks(env, monkeypatch):
+@pytest.mark.parametrize("early", [False, True])
+async def test_reminder_to_ban_pipeline_is_faster_and_keeps_fresh_member_checks(env, monkeypatch, early):
     monkeypatch.setattr("qq_card_guard.platform.random.uniform", lambda low, high: (low + high) / 2)
     env.box.settings = replace(
         env.box.settings,
@@ -263,8 +264,11 @@ async def test_reminder_to_ban_pipeline_is_faster_and_keeps_fresh_member_checks(
             await kwargs["action"]()
 
     env.router.guard = Guard()
-    for _ in range(2):
-        env.clock.now = max(case["due"], await env.store.call("get", "gap:" + A, 0), env.clock()) + 0.01
+    for stage in range(2):
+        due = case["due"]
+        if stage == 1 and not early:
+            due = max(case["ban_not_before"], await env.store.call("get", "gap:" + A, 0))
+        env.clock.now = max(due, env.clock()) + 0.01
         await Executor(env.service).process(case, api)
         case = await env.store.call("case", case["id"])
     assert case["phase"] == "watch" and case["mute_state"] == "unverified"
@@ -277,5 +281,10 @@ async def test_reminder_to_ban_pipeline_is_faster_and_keeps_fresh_member_checks(
     assert trace["outcome"] == "confirmed" and trace["reminder_reference"] == "completed"
     assert 1500 <= trace["since_reminder_ms"] < 11000
     assert trace["configured_delay_ms"] == 1500
+    assert trace["since_reminder_ms"] == pytest.approx(7500 if early else 7910, abs=1)
+    if early:
+        assert trace["preparation_overlap_ms"] > 1000
+    assert (after_notify[0]["at"] < trace["write_not_before"]) == early
+    assert after_notify[-1]["at"] >= trace["write_not_before"]
     assert trace["details_ms"]["read_wait"] > trace["details_ms"]["api:set_group_ban"]
     assert abs(sum(trace["stages_ms"].values()) - trace["duration_ms"]) < 1

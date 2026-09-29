@@ -12,6 +12,8 @@ from .scheduling import followup_window
 from .store import key
 from .timing import ActionTiming
 
+PREPARE_AHEAD_SECONDS = 2
+
 
 class Executor:
     def __init__(self, service):
@@ -59,6 +61,8 @@ class Executor:
             "operation_gap": await self.db.call("get", "gap:" + adapter.account, 0),
         }
         if new:
+            if case["phase"] == "ban":
+                deadlines["action_delay"] = case.get("ban_not_before", 0)
             deadlines["startup_wait"] = await self.db.call("get", "startup", 0)
             if await self.db.call("get", "block:" + adapter.account, {}):
                 raise Later("账号有结果不明的操作，新增处理已暂停。", self.now() + 300)
@@ -72,12 +76,61 @@ class Executor:
                 "connection_recovery": "等待连接恢复冷却。",
                 "manual_recovery": "等待管理员恢复后的冷却。",
                 "operation_gap": "等待操作间隔。",
+                "action_delay": "等待提醒后的禁言延迟。",
                 "startup_wait": "等待插件启动缓冲。",
             }
             raise Later(
                 reasons[code], waits[code], code=code, waits=waits, wait_seconds=round(waits[code] - now, 3)
             )
         return pace
+
+    def short_action_wait(self, exc):
+        """Only ordinary short delays may overlap read-only preparation."""
+        waits = exc.details.get("waits", {})
+        return (
+            bool(waits)
+            and set(waits) <= {"operation_gap", "action_delay"}
+            and 0 < exc.until - self.now() <= PREPARE_AHEAD_SECONDS
+        )
+
+    async def prepare_ban(self, case, adapter, timing, online):
+        with timing.stage("gate"):
+            try:
+                await self.gate(case, adapter, True)
+                return
+            except Later as exc:
+                if not case.get("ban_not_before") or not self.short_action_wait(exc):
+                    raise
+                remaining = exc.until - self.now()
+
+        # No account/shared queue lock here. Permissions and target membership are
+        # deliberately left until after queueing; only short-lived identity/status may carry over.
+        started = timing.clock()
+        try:
+            if not await online():
+                raise Later("QQ当前离线，等待连接恢复。", self.now() + 300)
+            with timing.stage("identity_preview"):
+                if await adapter.identity(max_age=10, priority=0) != case["account"]:
+                    raise GuardError("提交前机器人身份改变，请重新核对账号绑定。")
+        finally:
+            timing.fields["preparation_overlap_ms"] = round(
+                min(remaining, max(0, timing.clock() - started)) * 1000, 2
+            )
+
+        with timing.stage("gate"):
+            try:
+                await self.gate(case, adapter, True)
+                return
+            except Later as exc:
+                if not self.short_action_wait(exc):
+                    raise
+                remaining = exc.until - self.now()
+        # One bounded sleep outside all execution locks. If another operation extends
+        # the gap again, the final gate defers to the scheduler instead of looping here.
+        with timing.stage("remaining_delay"):
+            await self.s.sleep(remaining)
+        with timing.stage("gate"):
+            await self.gate(case, adapter, True)
 
     async def process(self, case, adapter):
         self.s.healthy()
@@ -192,17 +245,19 @@ class Executor:
     async def _write(self, case, adapter, phase, timing):
         lock = self.s.account_locks.setdefault(adapter.account, asyncio.Lock())
         new = phase in ("notify", "ban")
-        with timing.stage("gate"):
-            await self.gate(case, adapter, new)
         guard = self.s.router.shared_guard()
         queue_started = None
+        queue_online = 0
         online_result = None
 
         def finish_queue_wait():
             nonlocal queue_started
             if queue_started is not None:
                 # Online checks are measured separately; do not double-count them as queueing.
-                timing.add("queue_wait", timing.clock() - queue_started - timing.stages.get("online", 0))
+                timing.add(
+                    "queue_wait",
+                    timing.clock() - queue_started - (timing.stages.get("online", 0) - queue_online),
+                )
                 queue_started = None
 
         async def attempt():
@@ -238,12 +293,19 @@ class Executor:
                     return True
                 return False
 
+        if phase == "ban":
+            await self.prepare_ban(case, adapter, timing, online)
+        else:
+            with timing.stage("gate"):
+                await self.gate(case, adapter, new)
+
         if guard:
             pace = self.s.settings().pace
             options = {}
             if getattr(guard, "scheduling_version", 1) >= 3:
                 options = dict(priority=2 if new else 1, group=case["gid"], label="名片规范")
             queue_started = timing.clock()
+            queue_online = timing.stages.get("online", 0)
             try:
                 await guard.run(
                     account=adapter.pid,
@@ -425,6 +487,8 @@ class Executor:
                 raise Later("提交前配置变化，已取消本次发送。", self.now() + 5)
             if new and self.now() > deadline:
                 raise Later("提交前处理已过期，取消发送。", self.now() + 1)
+            if kind == "ban" and self.now() < case.get("ban_not_before", 0):
+                raise Later("等待提醒后的禁言延迟。", case["ban_not_before"], code="action_delay")
             if new and (
                 not self.s.settings().enabled
                 or not current.enabled
@@ -474,11 +538,12 @@ class Executor:
                     sent_at=at,
                     notify_completed_at=completed_at,
                     ban_delay_seconds=delay if case["minutes"] else 0,
+                    ban_not_before=due if case["minutes"] else 0,
                     recall_state="pending",
                     next_round=next_round,
                     phase="ban" if case["minutes"] else "watch",
                     reason="已提醒，等待名片修改",
-                    due=due,
+                    due=max(completed_at, due - PREPARE_AHEAD_SECONDS) if case["minutes"] else due,
                     execute_before=due + 120,
                     notice_serial=subject.get("ban_serial", 0),
                 )

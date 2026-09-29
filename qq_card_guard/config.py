@@ -47,6 +47,7 @@ class Later(GuardError):
     def routine(self):
         return self.code in {
             "operation_gap",
+            "action_delay",
             "startup_wait",
             "manual_recovery",
         } and "connection_recovery" not in self.details.get("waits", {})

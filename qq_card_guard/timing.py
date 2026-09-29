@@ -80,6 +80,7 @@ class ActionTiming:
             if self.phase == "ban" and self.case["sent_at"]:
                 at = self.case.get("notify_completed_at", self.case["sent_at"])
                 fields.update(
+                    write_not_before=self.case.get("ban_not_before"),
                     since_reminder_ms=round(max(0, self.service.clock() - at) * 1000, 2),
                     reminder_reference="completed" if "notify_completed_at" in self.case else "submitted",
                     configured_delay_ms=self.case["ban_delay_seconds"] * 1000

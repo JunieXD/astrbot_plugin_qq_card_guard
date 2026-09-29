@@ -105,6 +105,7 @@ async def test_failed_write_response_is_not_retried_or_assumed_unsent(env):
     "code,text,level",
     [
         ("operation_gap", "等待操作间隔", "INFO"),
+        ("action_delay", "等待提醒后的禁言延迟", "INFO"),
         ("startup_wait", "等待插件启动缓冲", "INFO"),
         ("manual_recovery", "等待管理员恢复后的冷却", "INFO"),
         ("connection_recovery", "等待连接恢复冷却", "WARNING"),
@@ -115,6 +116,8 @@ async def test_gate_preserves_deadline_and_logs_specific_wait(env, code, text, l
     until = env.clock() + 30
     if code == "connection_recovery":
         env.adapter.recovery_until = until
+    elif code == "action_delay":
+        case.update(phase="ban", ban_not_before=until)
     else:
         key = {"operation_gap": "gap:" + A, "startup_wait": "startup", "manual_recovery": "recovery:" + A}[
             code

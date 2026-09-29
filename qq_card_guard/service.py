@@ -575,6 +575,8 @@ class Service:
         finally:
             self.inspections.reset(token)
             self.running.discard(key(a, g, u))
+            if kind == "case" and item["phase"] == "notify" and not self.stopped:
+                self.wake.set()
 
     async def tick(self):
         self.healthy()
@@ -603,6 +605,7 @@ class Service:
         checkpoint = 0
         last_error = ""
         while not self.stopped:
+            self.wake.clear()
             try:
                 await self.tick()
                 if self.clock() >= checkpoint:
@@ -617,7 +620,6 @@ class Service:
             except Exception as exc:
                 self.failure = "调度异常，已停止自动操作，请查看日志后重载。"
                 self.journal.record("调度异常", exception=exc)
-            self.wake.clear()
             try:
                 await asyncio.wait_for(self.wake.wait(), timeout=1)
             except asyncio.TimeoutError:
