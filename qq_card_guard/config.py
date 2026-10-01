@@ -142,6 +142,8 @@ class Pace:
         FollowupStep(10, 180, 300),
         FollowupStep(30, 600, 1200),
         FollowupStep(120, 1800, 3600),
+        FollowupStep(1440, 7200, 14400),
+        FollowupStep(4320, 21600, 43200),
     )
     startup_min: int = 30
     startup_max: int = 90

@@ -33,16 +33,20 @@ async def queue(env, message_id=999):
     return await env.store.call("subject", A, G, U)
 
 
-async def test_cache_is_fixed_from_real_verification_not_extended_by_speech(env):
+@pytest.mark.parametrize("minutes", [60, 1440])
+async def test_cache_is_fixed_from_real_verification_not_extended_by_speech(env, minutes):
+    env.box.settings = replace(
+        env.box.settings, groups=(replace(env.policy, compliant_cache_minutes=minutes),)
+    )
     compliant(env)
     await env.speak()
     start = env.clock()
-    for elapsed in (10, 1000, 3599):
+    for elapsed in (10, minutes * 30, minutes * 60 - 1):
         env.clock.now = start + elapsed
         await env.speak()
     assert len(env.adapter.reads) == 1
     assert (await env.store.call("subject", A, G, U))["screening"]["at"] == start
-    env.clock.now = start + 3600
+    env.clock.now = start + minutes * 60
     await env.speak()
     assert len(env.adapter.reads) == 2
     assert not env.adapter.writes
@@ -56,9 +60,14 @@ async def test_disabled_cache_queries_each_new_speech(env):
     assert len(env.adapter.reads) == 2
 
 
-async def test_changed_message_card_invalidates_cache_and_creates_case(env):
+@pytest.mark.parametrize("minutes", [60, 1440])
+async def test_changed_message_card_invalidates_cache_and_creates_case(env, minutes):
+    env.box.settings = replace(
+        env.box.settings, groups=(replace(env.policy, compliant_cache_minutes=minutes),)
+    )
     compliant(env)
     await env.speak()
+    env.clock.now += minutes * 30
     env.adapter.people[U] = replace(env.adapter.people[U], card="改回不合格")
     assert (await env.speak())["phase"] == "notify"
     assert len(env.adapter.reads) == 2
@@ -74,9 +83,14 @@ async def test_changed_notice_does_not_trust_stale_api_or_old_cache(env):
 
 
 @pytest.mark.parametrize("change", ["policy", "connection", "membership", "role"])
-async def test_cache_invalidates_on_identity_rule_or_membership_change(env, change):
+@pytest.mark.parametrize("minutes", [60, 1440])
+async def test_cache_invalidates_on_identity_rule_or_membership_change(env, change, minutes):
+    env.box.settings = replace(
+        env.box.settings, groups=(replace(env.policy, compliant_cache_minutes=minutes),)
+    )
     compliant(env)
     await env.speak()
+    env.clock.now += minutes * 30
     if change == "policy":
         env.box.settings = replace(env.box.settings, groups=(replace(env.policy, format_help="新说明"),))
     elif change == "connection":
@@ -209,7 +223,11 @@ async def test_repeated_speech_in_grace_uses_followup_without_queries(env):
     assert (await env.store.call("case", case["id"]))["phase"] == "watch"
 
 
-async def test_cache_never_hides_pending_recall(env):
+@pytest.mark.parametrize("minutes", [60, 1440])
+async def test_cache_never_hides_pending_recall(env, minutes):
+    env.box.settings = replace(
+        env.box.settings, groups=(replace(env.policy, compliant_cache_minutes=minutes),)
+    )
     case = await env.step(await env.speak())
     compliant(env)
     await env.speak()
@@ -252,11 +270,47 @@ async def test_stable_inspection_never_reuses_coalesced_read(env):
         (600, (180, 300)),
         (1800, (600, 1200)),
         (7200, (1800, 3600)),
+        (86399, (1800, 3600)),
+        (86400, (7200, 14400)),
+        (259199, (7200, 14400)),
+        (259200, (21600, 43200)),
     ],
 )
 def test_followup_tiers_from_sent_time(age, bounds):
     case = dict(created=1, sent_at=1000, mute_state="none", mute_until=0)
     assert followup_window(case, Pace(), 1000 + age)[1:] == bounds
+
+
+def test_active_mute_overrides_even_old_followup_tiers():
+    now = 400000
+    case = dict(created=1, sent_at=1000, mute_state="owned", mute_until=now + 30)
+    assert followup_window(case, Pace(), now)[1:] == (20, 40)
+
+
+@pytest.mark.parametrize("event", ["card_notice", "speech"])
+async def test_new_card_wakes_old_low_frequency_followup(env, event):
+    case = await env.step(await env.speak())
+    env.clock.now = case["sent_at"] + 4 * 86400
+    case = await env.step(case)
+    assert 21600 <= case["due"] - env.clock() <= 43200
+    compliant(env)
+    if event == "card_notice":
+        await env.notice("group_card", card_new=env.adapter.people[U].card)
+    else:
+        await queue(env)
+    case = await env.store.call("case", case["id"])
+    assert case["due"] <= env.clock() + 1
+    case = await env.step(await env.step(case))
+    assert case["recall_state"] == "recalled"
+    assert [w[0] for w in env.adapter.writes] == ["notify", "recall"]
+
+
+def test_custom_followup_schedule_is_not_replaced_by_new_defaults():
+    rows = [{"after_minutes": 120, "minimum": 1800, "maximum": 3600}]
+    pace = parse_settings({"followup_steps": rows}).pace
+    assert len(pace.followup_steps) == 1
+    case = dict(created=1, sent_at=1000, mute_state="none", mute_until=0)
+    assert followup_window(case, pace, 1000 + 4 * 86400)[1:] == (1800, 3600)
 
 
 async def test_active_mute_uses_fast_tier_and_reserved_budget_priority(env):

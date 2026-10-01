@@ -101,17 +101,19 @@ class Executor:
             except Later as exc:
                 if not case.get("ban_not_before") or not self.short_action_wait(exc):
                     raise
-                remaining = exc.until - self.now()
+                remaining = max(0, exc.until - self.now())
 
         # No account/shared queue lock here. Permissions and target membership are
         # deliberately left until after queueing; only short-lived identity/status may carry over.
         started = timing.clock()
         try:
-            if not await online():
-                raise Later("QQ当前离线，等待连接恢复。", self.now() + 300)
             with timing.stage("identity_preview"):
                 if await adapter.identity(max_age=10, priority=0) != case["account"]:
                     raise GuardError("提交前机器人身份改变，请重新核对账号绑定。")
+            # Identity reads can wait behind other reads. Check online afterwards so
+            # that wait cannot consume the status result's short reuse window.
+            if not await online():
+                raise Later("QQ当前离线，等待连接恢复。", self.now() + 300)
         finally:
             timing.fields["preparation_overlap_ms"] = round(
                 min(remaining, max(0, timing.clock() - started)) * 1000, 2
@@ -124,7 +126,7 @@ class Executor:
             except Later as exc:
                 if not self.short_action_wait(exc):
                     raise
-                remaining = exc.until - self.now()
+                remaining = max(0, exc.until - self.now())
         # One bounded sleep outside all execution locks. If another operation extends
         # the gap again, the final gate defers to the scheduler instead of looping here.
         with timing.stage("remaining_delay"):

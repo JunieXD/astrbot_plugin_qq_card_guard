@@ -8,7 +8,7 @@ from conftest import ADMIN, A, G, U
 from test_execution_timing import PipelineBot
 from test_platform import adapter
 
-from qq_card_guard.config import Later, Stage
+from qq_card_guard.config import GuardError, Later, Stage
 from qq_card_guard.executor import Executor
 from qq_card_guard.store import key
 
@@ -244,4 +244,63 @@ async def test_reload_cancels_pending_ban_even_with_early_preparation_schedule(e
     assert saved["phase"] == "watch"
     assert saved["ban_not_before"] == case["ban_not_before"]
     await Executor(env.service).process(saved, env.adapter)
+    assert [w[0] for w in env.adapter.writes] == ["notify"]
+
+
+async def test_slow_identity_preview_does_not_age_online_result_before_queue(env):
+    case = await pending_ban(env)
+
+    class SlowIdentityBot(PipelineBot):
+        async def call_action(self, action, **params):
+            if action == "get_login_info":
+                await env.clock.sleep(3)
+            return await super().call_action(action, **params)
+
+    bot = SlowIdentityBot(env)
+    api = adapter(env, bot)
+    api.account = A
+    api.identity_at = env.clock() - 11
+    case = await env.store.call("patch_case", case["id"], {"connection": api.stamp()})
+
+    class Guard:
+        class deferred_error(Exception):
+            pass
+
+        async def run(self, **kwargs):
+            assert await kwargs["online"]()
+            assert await kwargs["online"]()
+            await kwargs["action"]()
+
+    env.router.guard = Guard()
+    await Executor(env.service).process(case, api)
+    actions = [c["action"] for c in bot.calls]
+    assert actions[:2] == ["get_login_info", "get_status"]
+    assert actions.count("get_status") == actions.count("get_login_info") == 1
+    assert actions[-1] == "set_group_ban"
+    assert len([c for c in bot.calls if c["action"] == "get_group_member_info" and c["user_id"] == U]) == 2
+    trace = [r for r in env.journal.records if r["kind"] == "操作耗时"][-1]
+    assert trace["stages_ms"]["identity_preview"] >= 3000
+    assert sum(trace["stages_ms"].values()) == pytest.approx(trace["duration_ms"], abs=1)
+
+
+@pytest.mark.parametrize("error", ["account", "budget", "cancel"])
+async def test_failed_identity_preview_does_not_query_status_or_submit_ban(env, error):
+    case = await pending_ban(env)
+
+    async def identity(**kwargs):
+        if error == "account":
+            return "999999"
+        if error == "budget":
+            raise Later("读取预算不足", env.clock() + 60, code="read_budget")
+        raise asyncio.CancelledError()
+
+    async def online(**kwargs):
+        pytest.fail("Failed identity must stop further queries")
+
+    env.adapter.identity = identity
+    env.adapter.online = online
+    with pytest.raises(asyncio.CancelledError if error == "cancel" else GuardError):
+        await Executor(env.service).process(case, env.adapter)
+    assert not env.service.account_locks[A].locked()
+    assert not await env.store.call("has_operation", case["id"], "ban")
     assert [w[0] for w in env.adapter.writes] == ["notify"]
