@@ -15,6 +15,9 @@ from .rules import Member, message_fingerprint, message_id, number
 from .timing import api_timing
 
 WRITES = {"send_group_msg", "set_group_ban", "delete_msg"}
+# NapCat implements these two handlers using core.selfInfo only. Keep this list
+# narrow: a fast response does not prove that a group/member query is local.
+LOCAL_READS = frozenset({"get_login_info", "get_status"})
 
 
 class Adapter:
@@ -80,9 +83,10 @@ class Adapter:
                     await self.store.call(
                         "reserve_read", quota_key, self.clock(), self.pace().reads_per_hour, priority
                     )
-                    with api_timing("read_wait"):
-                        await self.sleep(max(0, self.next_read - self.clock()))
-                    self.next_read = self.clock() + random.uniform(*self.pace().interval("read"))
+                    if action not in LOCAL_READS:
+                        with api_timing("read_wait"):
+                            await self.sleep(max(0, self.next_read - self.clock()))
+                        self.next_read = self.clock() + random.uniform(*self.pace().interval("read"))
 
                 async def invoke():
                     self.stamp()
@@ -94,7 +98,17 @@ class Adapter:
 
                 with (
                     api_timing("api:" + action),
-                    self.journal.span("平台接口", api=action, account=self.account, platform=self.pid),
+                    self.journal.span(
+                        "平台接口",
+                        api=action,
+                        account=self.account,
+                        platform=self.pid,
+                        read_scope="write"
+                        if action in WRITES
+                        else "local"
+                        if action in LOCAL_READS
+                        else "qq",
+                    ),
                 ):
                     try:
                         result = await asyncio.wait_for(asyncio.create_task(invoke()), timeout=25)

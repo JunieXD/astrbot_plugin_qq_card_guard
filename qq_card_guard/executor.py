@@ -8,11 +8,18 @@ from contextlib import nullcontext
 
 from .config import GuardError, Later
 from .rules import message_fingerprint
-from .scheduling import followup_window
+from .scheduling import PREPARE_AHEAD_SECONDS, action_schedule, followup_window
 from .store import key
-from .timing import ActionTiming
+from .timing import ActionTiming, flow_timing
 
-PREPARE_AHEAD_SECONDS = 2
+TIMER_RESIDUAL_SECONDS = 0.05
+UNMUTE_SKIP_REASONS = {
+    "disabled": "配置未开启合规后解禁",
+    "none": "本事项没有执行禁言",
+    "expired": "禁言已到期，无需发送解禁",
+    "external": "禁言归属已变化，不覆盖其他管理操作",
+    "manual": "缺少可确认的禁言归属证据，交由人工核对",
+}
 
 
 class Executor:
@@ -59,10 +66,9 @@ class Executor:
             "connection_recovery": adapter.recovery_until,
             "manual_recovery": await self.db.call("get", "recovery:" + adapter.account, 0),
             "operation_gap": await self.db.call("get", "gap:" + adapter.account, 0),
+            "action_delay": case.get(case["phase"] + "_not_before", 0),
         }
         if new:
-            if case["phase"] == "ban":
-                deadlines["action_delay"] = case.get("ban_not_before", 0)
             deadlines["startup_wait"] = await self.db.call("get", "startup", 0)
             if await self.db.call("get", "block:" + adapter.account, {}):
                 raise Later("账号有结果不明的操作，新增处理已暂停。", self.now() + 300)
@@ -76,7 +82,11 @@ class Executor:
                 "connection_recovery": "等待连接恢复冷却。",
                 "manual_recovery": "等待管理员恢复后的冷却。",
                 "operation_gap": "等待操作间隔。",
-                "action_delay": "等待提醒后的禁言延迟。",
+                "action_delay": {
+                    "notify": "等待提醒延迟。",
+                    "ban": "等待提醒后的禁言延迟。",
+                    "settle": "等待恢复操作延迟。",
+                }.get(case["phase"], "等待操作延迟。"),
                 "startup_wait": "等待插件启动缓冲。",
             }
             raise Later(
@@ -93,13 +103,14 @@ class Executor:
             and 0 < exc.until - self.now() <= PREPARE_AHEAD_SECONDS
         )
 
-    async def prepare_ban(self, case, adapter, timing, online):
+    async def prepare_action(self, case, adapter, timing, online):
+        new = case["phase"] in ("notify", "ban")
         with timing.stage("gate"):
             try:
-                await self.gate(case, adapter, True)
+                await self.gate(case, adapter, new)
                 return
             except Later as exc:
-                if not case.get("ban_not_before") or not self.short_action_wait(exc):
+                if not case.get(case["phase"] + "_not_before") or not self.short_action_wait(exc):
                     raise
                 remaining = max(0, exc.until - self.now())
 
@@ -108,7 +119,7 @@ class Executor:
         started = timing.clock()
         try:
             with timing.stage("identity_preview"):
-                if await adapter.identity(max_age=10, priority=0) != case["account"]:
+                if await adapter.identity(max_age=10, priority=0 if new else 2) != case["account"]:
                     raise GuardError("提交前机器人身份改变，请重新核对账号绑定。")
             # Identity reads can wait behind other reads. Check online afterwards so
             # that wait cannot consume the status result's short reuse window.
@@ -121,18 +132,36 @@ class Executor:
 
         with timing.stage("gate"):
             try:
-                await self.gate(case, adapter, True)
+                await self.gate(case, adapter, new)
                 return
             except Later as exc:
                 if not self.short_action_wait(exc):
                     raise
                 remaining = max(0, exc.until - self.now())
+                waited_until = exc.until
         # One bounded sleep outside all execution locks. If another operation extends
         # the gap again, the final gate defers to the scheduler instead of looping here.
         with timing.stage("remaining_delay"):
             await self.s.sleep(remaining)
         with timing.stage("gate"):
-            await self.gate(case, adapter, True)
+            try:
+                await self.gate(case, adapter, new)
+                return
+            except Later as exc:
+                # Some Windows timers return a few milliseconds early. Correct
+                # once, only for the same deadline; extended gaps/cooldowns defer.
+                residual = exc.until - self.now()
+                if not (
+                    self.short_action_wait(exc)
+                    and exc.until <= waited_until
+                    and residual <= TIMER_RESIDUAL_SECONDS
+                ):
+                    raise
+        self.s.journal.record("定时器提前唤醒", residual_ms=round(residual * 1000, 2))
+        with timing.stage("timer_correction"):
+            await self.s.sleep(residual + 0.01)
+        with timing.stage("gate"):
+            await self.gate(case, adapter, new)
 
     async def process(self, case, adapter):
         self.s.healthy()
@@ -227,12 +256,16 @@ class Executor:
                 phase="settle",
                 mute_state=state,
                 reason="成员已离群或重新入群，只核对旧提醒",
-                due=self.now() + self.delay("recall"),
+                settlement_detected_at=case.get("settlement_detected_at") or self.now(),
+                settlement_state="departed",
+                **action_schedule("settle", self.now(), self.delay("recall")),
             )
             return
         if verdict.state in ("compliant", "exempt"):
             await self.patch(case, mute_state=state)
-            await self.s.settle_member(case["account"], case["gid"], case["uid"], verdict.reason)
+            await self.s.settle_member(
+                case["account"], case["gid"], case["uid"], verdict.reason, state=verdict.state
+            )
         else:
             await self.poll(case, mute_state=state, reason=verdict.reason)
 
@@ -295,11 +328,7 @@ class Executor:
                     return True
                 return False
 
-        if phase == "ban":
-            await self.prepare_ban(case, adapter, timing, online)
-        else:
-            with timing.stage("gate"):
-                await self.gate(case, adapter, new)
+        await self.prepare_action(case, adapter, timing, online)
 
         if guard:
             pace = self.s.settings().pace
@@ -397,7 +426,9 @@ class Executor:
                 case,
                 phase="settle",
                 reason="等待期间成员已合规、豁免或离群",
-                due=self.now() + self.delay("recall"),
+                settlement_detected_at=case.get("settlement_detected_at") or self.now(),
+                settlement_state=verdict.state if verdict else "departed",
+                **action_schedule("settle", self.now(), self.delay("recall")),
             )
             return
         if verdict and verdict.state == "unknown":
@@ -417,7 +448,13 @@ class Executor:
             return
         if phase == "settle":
             if member and verdict.state not in ("compliant", "exempt"):
-                await self.poll(case, phase="watch", reason="名片再次不合规，保留现有处理")
+                await self.poll(
+                    case,
+                    phase="watch",
+                    settlement_detected_at=0,
+                    settlement_state="",
+                    reason="名片再次不合规，保留现有处理",
+                )
                 return
             with timing.stage("mute_ownership"):
                 mute_state = await self.ownership(case, member, subject)
@@ -435,6 +472,16 @@ class Executor:
             else:
                 kind = "recall"
             if kind == "recall":
+                skip = "disabled" if not policy.unmute_on_compliance else case["mute_state"]
+                if skip != "released" and case.get("unmute_skip_reason") != skip:
+                    case = await self.patch(case, unmute_skip_reason=skip)
+                    self.s.journal.record(
+                        "跳过解禁",
+                        detail=UNMUTE_SKIP_REASONS.get(skip, "禁言归属未确认，不自动解禁"),
+                        case=case["id"],
+                        reason=skip,
+                        mute_until=case["mute_until"],
+                    )
                 if (
                     not policy.recall_on_compliance
                     or not case["message_id"]
@@ -489,8 +536,9 @@ class Executor:
                 raise Later("提交前配置变化，已取消本次发送。", self.now() + 5)
             if new and self.now() > deadline:
                 raise Later("提交前处理已过期，取消发送。", self.now() + 1)
-            if kind == "ban" and self.now() < case.get("ban_not_before", 0):
-                raise Later("等待提醒后的禁言延迟。", case["ban_not_before"], code="action_delay")
+            not_before = case.get(phase + "_not_before", 0)
+            if self.now() < not_before:
+                raise Later("等待操作延迟。", not_before, code="action_delay")
             if new and (
                 not self.s.settings().enabled
                 or not current.enabled
@@ -534,18 +582,17 @@ class Executor:
                     )
                     * 60
                 )
+                schedule = action_schedule("ban", completed_at, delay) if case["minutes"] else {"due": due}
                 changes = dict(
                     message_id=result,
                     message_hash=message_fingerprint(message),
                     sent_at=at,
                     notify_completed_at=completed_at,
-                    ban_delay_seconds=delay if case["minutes"] else 0,
-                    ban_not_before=due if case["minutes"] else 0,
                     recall_state="pending",
                     next_round=next_round,
                     phase="ban" if case["minutes"] else "watch",
                     reason="已提醒，等待名片修改",
-                    due=max(completed_at, due - PREPARE_AHEAD_SECONDS) if case["minutes"] else due,
+                    **schedule,
                     execute_before=due + 120,
                     notice_serial=subject.get("ban_serial", 0),
                 )
@@ -557,6 +604,7 @@ class Executor:
                     changes = dict(
                         phase="watch",
                         ban_at=at,
+                        ban_completed_at=self.now(),
                         ban_baseline=subject.get("ban_serial", 0),
                         mute_until=at + seconds,
                         next_round=max(case["next_round"], at + seconds),
@@ -568,15 +616,24 @@ class Executor:
                     changes = dict(
                         phase="settle",
                         mute_state="released",
-                        due=self.now() + self.delay("recall"),
+                        unmute_completed_at=self.now(),
+                        **action_schedule("settle", self.now(), self.delay("recall")),
                         reason="已核验解除本插件禁言",
                     )
             else:
                 with timing.stage("submit"):
                     result = await adapter.recall(case["message_id"], fence)
-                changes = dict(phase="closed", recall_state="recalled", reason="已撤回提醒")
+                changes = dict(
+                    phase="closed",
+                    recall_state="recalled",
+                    recall_completed_at=self.now(),
+                    reason="已撤回提醒",
+                )
             with timing.stage("persistence"):
-                await self.db.call("finish", oid, "confirmed", {"accepted": True}, changes, self.now())
+                finished = await self.db.call(
+                    "finish", oid, "confirmed", {"accepted": True}, changes, self.now()
+                )
+                timing.case = finished
             timing.outcome = "confirmed"
             self.s.journal.record(
                 "操作完成",
@@ -585,6 +642,7 @@ class Executor:
                 account=adapter.account,
                 group=case["gid"],
                 user=case["uid"],
+                **flow_timing(finished),
             )
         except BaseException as exc:
             if not sent:

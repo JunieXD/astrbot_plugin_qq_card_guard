@@ -120,7 +120,7 @@
 
 ### 耗时排查
 
-在 `guard.log` 搜索「操作耗时」，用 `case` 查同一事项，用 `attempt` 查同一次执行的API调用。耗时由单调时钟测量，单位为毫秒；配置、调度时间使用墙上时钟。仅有成功的「操作完成」或 `outcome=confirmed` 才代表操作已确认，不能把一条耗时日志当成执行成功。
+在 `guard.log` 搜索「操作耗时」，用 `case` 查同一事项，用 `attempt` 查同一次执行的API调用。单次执行耗时由单调时钟测量，单位为毫秒；配置、调度和持久化的跨阶段时间使用墙上时钟。仅有成功的「操作完成」或 `outcome=confirmed` 才代表操作已确认，不能把一条耗时日志当成执行成功。
 
 | 字段 | 含义 |
 | --- | --- |
@@ -129,10 +129,16 @@
 | `details_ms.read_wait` | 核验中主动等待下一次读取的总耗时，已包含在各阶段中 |
 | `details_ms.api:接口名` | 实际接口调用耗时，已包含在各阶段中，不要再与阶段耗时相加 |
 | `scheduled_for` / `scheduler_lag_ms` | 本次计划执行时间，以及任务开始时比计划晚了多久 |
-| `configured_delay_ms` | 本轮提醒成功后抽取的禁言前等待时间；旧事项没有此字段记录时为 `null` |
-| `write_not_before` | 本轮最早允许禁言的持久化时间；提前准备的计划时间不代表可以提前禁言，旧事项为 `null` |
+| `configured_delay_ms` | 本次操作抽取的等待时间；恢复阶段指本次解禁或撤回的等待；旧事项可能为 `null` |
+| `write_not_before` | 本次操作最早允许提交的持久化时间；提前准备的计划时间不代表可以提前操作，旧事项可能为 `null` |
 | `preparation_overlap_ms` | 提前在线/身份检查与当时等待窗口重叠的时间，包含其中的读取等待；已包含在阶段耗时中，不等于相比旧版节省的时间，仅提前准备时记录 |
 | `since_reminder_ms` | 禁言阶段从提醒到本次执行结束的时间；要结合 `outcome` 判断是否实际禁言 |
 | `reminder_reference` | 新事项为 `completed`（提醒接口完成），旧事项可能为 `submitted`（提醒开始提交） |
+| `flow_at` | QQ触发发言、插件收到事件、各操作成功和首次确认本轮合规/豁免/离群的持久化时间点，单位为Unix秒；缺少的历史时间不补猜 |
+| `flow_ms` | 从发言/收到事件到提醒、发言到禁言、提醒到禁言、确认合规到解禁/撤回、解禁到撤回的总耗时；仅由已确认时间点计算 |
 
-阶段名包括：`gate`（冷却/暂停检查）、`queue_wait`（共享队列等待，不含在线检查）、`online`（在线检查）、`identity_preview`（提前身份检查）、`remaining_delay`（提前检查后尚需等待的时间）、`account_lock` / `read_lock`（锁等待）、`identity`（提交前身份）、`bot_permission`（机器人权限）、`group_state`（群状态）、`member_checks`（成员双次核验）、`mute_ownership`（禁言归属）、`message_lookup`（原提醒定位）、`submit`（提交操作）、`persistence`（提交记录保存）。按实际经过的阶段记录，暂缓、取消和失败也保留已发生的耗时。
+阶段名包括：`gate`（冷却/暂停检查）、`queue_wait`（共享队列等待，不含在线检查）、`online`（在线检查）、`identity_preview`（提前身份检查）、`remaining_delay`（提前检查后尚需等待的时间）、`timer_correction`（定时器提前醒来的一次小幅补等）、`account_lock` / `read_lock`（锁等待）、`identity`（提交前身份）、`bot_permission`（机器人权限）、`group_state`（群状态）、`member_checks`（成员双次核验）、`mute_ownership`（禁言归属）、`message_lookup`（原提醒定位）、`submit`（提交操作）、`persistence`（提交记录保存）。按实际经过的阶段记录，暂缓、取消和失败也保留已发生的耗时。
+
+`flow_ms` 中的 `delivery` 是QQ事件时间到插件收到事件的差；`speech_to_notify` / `received_to_notify` 分别从发言和收到事件计时；`speech_to_ban` / `notify_to_ban` 是到禁言成功的总耗时；`detection_to_unmute` / `detection_to_recall` 从 `settlement_detected_at` 计时；`unmute_to_recall` 为解禁成功到撤回成功。QQ事件通常只有秒精度，插件首次确认合规也不代表用户实际改名时刻。时钟回退产生的负值不报告为有效耗时；旧事项缺少时间点时省略对应字段。合规后再次改坏会结束本轮恢复计时，下一次确认合规重新计时。
+
+平台接口日志的 `read_scope` 区分 `local`（NapCat本地登录/在线状态）、`qq`（保留读取间隔的资料接口）和 `write`。本地查询仍占查询额度，不能通过连续查询绕过预算。「跳过解禁」记录代码及中文原因：`expired` 已到期、`none` 未禁言、`external` 其他管理操作、`manual` 归属无法确认、`disabled` 配置未开启；它不表示发送过解禁请求。

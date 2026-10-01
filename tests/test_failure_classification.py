@@ -113,6 +113,7 @@ async def test_failed_write_response_is_not_retried_or_assumed_unsent(env):
 )
 async def test_gate_preserves_deadline_and_logs_specific_wait(env, code, text, level):
     case = await env.speak()
+    env.clock.now = case["notify_not_before"]
     until = env.clock() + 30
     if code == "connection_recovery":
         env.adapter.recovery_until = until
@@ -143,6 +144,7 @@ async def test_gate_preserves_deadline_and_logs_specific_wait(env, code, text, l
 
 async def test_overlapping_waits_keep_all_causes_and_do_not_hide_connection_warning(env):
     case = await env.speak()
+    env.clock.now = case["notify_not_before"]
     env.adapter.recovery_until = env.clock() + 10
     await env.store.call("set", "gap:" + A, env.clock() + 20)
     with pytest.raises(Later) as caught:

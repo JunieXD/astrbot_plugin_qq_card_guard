@@ -2,6 +2,18 @@
 
 from __future__ import annotations
 
+PREPARE_AHEAD_SECONDS = 2
+
+
+def action_schedule(phase, now, delay):
+    """Wake for local preparation; the durable deadline still fences the write."""
+    not_before = now + delay
+    return {
+        "due": max(now, not_before - PREPARE_AHEAD_SECONDS),
+        phase + "_not_before": not_before,
+        phase + "_delay_seconds": delay,
+    }
+
 
 def followup_window(case, pace, now):
     if case["mute_state"] in ("owned", "unverified") and case["mute_until"] > now:

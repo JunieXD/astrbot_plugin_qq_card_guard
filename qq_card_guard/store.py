@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 
 from .config import GuardError, Later
+from .scheduling import action_schedule
 
 
 def key(account, gid, uid=""):
@@ -472,7 +473,9 @@ class Store:
                 "round": round_no,
                 "minutes": minutes,
                 "created": now,
-                "due": due,
+                "trigger_speech_at": subject["speech_at"],
+                "trigger_received_at": subject["received_at"],
+                **action_schedule("notify", now, max(0, due - now)),
                 "execute_before": due + 300,
                 "phase": "notify",
                 "next_round": 0,

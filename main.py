@@ -11,13 +11,13 @@ from astrbot.api.star import Context, Star, StarTools, register
 from .qq_card_guard.command_access import CommandAccess
 from .qq_card_guard.commands import Commands
 from .qq_card_guard.config import CommandPermissionError, GuardError, parse_settings
-from .qq_card_guard.platform import Router
+from .qq_card_guard.platform import LOCAL_READS, Router
 from .qq_card_guard.resources import InstanceLock, Journal, exception_detail
 from .qq_card_guard.service import Service
 from .qq_card_guard.store import Store
 
 
-@register("astrbot_plugin_qq_card_guard", "JunieXD", "按群名片规则提醒，支持阶梯禁言和改名后恢复", "0.2.4")
+@register("astrbot_plugin_qq_card_guard", "JunieXD", "按群名片规则提醒，支持阶梯禁言和改名后恢复", "0.2.5")
 class QQCardGuard(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context=context, config=config)
@@ -49,6 +49,15 @@ class QQCardGuard(Star):
             for gid, error in settings.errors:
                 logger.warning("QQ 群名片规范：群 %s 配置无效：%s", gid, error)
             self.journal.record(
+                "执行节奏配置",
+                intervals={
+                    name: settings.pace.interval(name)
+                    for name in ("notify", "ban", "unmute", "recall", "gap", "read", "poll", "muted_poll")
+                },
+                local_status_reads=sorted(LOCAL_READS),
+                reads_per_hour=settings.pace.reads_per_hour,
+            )
+            self.journal.record(
                 "缓存与补查配置",
                 groups=[
                     dict(
@@ -64,7 +73,7 @@ class QQCardGuard(Star):
                 ],
             )
             logger.info(
-                "QQ 群名片规范 v0.2.4 已加载；发言检查：%s；有效群：%s；查询上限：%s/小时；"
+                "QQ 群名片规范 v0.2.5 已加载；发言检查：%s；有效群：%s；查询上限：%s/小时；"
                 "写操作间隔：%s～%s秒；读取间隔：%s～%s秒。",
                 "开启" if settings.enabled else "关闭",
                 len(settings.groups),
@@ -139,8 +148,12 @@ class QQCardGuard(Star):
                 str(raw.get("self_id", "")) if isinstance(raw, dict) else str(getattr(raw, "self_id", ""))
             )
             if not await self.command_access.allowed(
-                service, text=event.get_message_str(), actor=str(event.get_sender_id()),
-                platform=str(event.platform_meta.id), account=account, bot_admin=bot_admin,
+                service,
+                text=event.get_message_str(),
+                actor=str(event.get_sender_id()),
+                platform=str(event.platform_meta.id),
+                account=account,
+                bot_admin=bot_admin,
             ):
                 return
             response_authorized = True

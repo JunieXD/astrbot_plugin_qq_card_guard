@@ -10,7 +10,7 @@ from dataclasses import replace
 
 from .config import CommandPermissionError, GuardError, Later, Policy, Stage, fingerprint
 from .rules import judge, number
-from .scheduling import cache_check
+from .scheduling import action_schedule, cache_check
 from .store import key
 
 
@@ -379,7 +379,7 @@ class Service:
             raise Later(error[1], self.clock() + 300)
         member, current, verdict = await self.inspect(policy, adapter, u)
         if verdict.state in ("compliant", "exempt"):
-            await self.settle_member(a, g, u, verdict.reason)
+            await self.settle_member(a, g, u, verdict.reason, state=verdict.state)
         elif verdict.state == "invalid" and policy.mode != "仅观察":
             if await self.store.call("get", "block:" + a, {}):
                 raise Later("账号新操作已暂停，请查看状态和待核对记录。", self.clock() + 300)
@@ -416,7 +416,7 @@ class Service:
                 raise Later("配置在核验期间改变，重新检查。", self.clock() + 1)
             case = await self.store.call(
                 "new_case",
-                current,
+                {**current, "speech_at": subject["speech_at"], "received_at": subject["received_at"]},
                 policy,
                 adapter.pid,
                 adapter.stamp(),
@@ -427,23 +427,49 @@ class Service:
                 settings.pace.max_pending,
             )
             self.journal.record(
-                "安排提醒", case=case["id"], account=a, group=g, user=u, round=round_no, due=case["due"]
+                "安排提醒",
+                case=case["id"],
+                account=a,
+                group=g,
+                user=u,
+                round=round_no,
+                due=case["due"],
+                write_not_before=case["notify_not_before"],
+                trigger_speech_at=case["trigger_speech_at"],
+                trigger_received_at=case["trigger_received_at"],
             )
         await self.store.call("evaluated", a, g, u, subject["speech_at"], subject["version"])
 
-    async def settle_member(self, a, g, u, reason):
+    async def settle_member(self, a, g, u, reason, *, state="compliant"):
+        detected = self.clock()
         for case in await self.store.call("member_cases", a, g, u):
             if case["phase"] in ("closed", "settle", "review"):
                 continue
             action = "unmute" if case["mute_state"] in ("owned", "unverified") else "recall"
-            await self.store.call(
+            planned = await self.store.call(
                 "patch_case",
                 case["id"],
                 {
                     "phase": "settle",
                     "reason": reason,
-                    "due": self.clock() + random.uniform(*self.settings().pace.interval(action)),
+                    "settlement_detected_at": case.get("settlement_detected_at") or detected,
+                    "settlement_state": state,
+                    **action_schedule(
+                        "settle", self.clock(), random.uniform(*self.settings().pace.interval(action))
+                    ),
                 },
+            )
+            self.journal.record(
+                "安排恢复",
+                case=case["id"],
+                account=a,
+                group=g,
+                user=u,
+                state=state,
+                reason=reason,
+                detected_at=planned["settlement_detected_at"],
+                due=planned["due"],
+                write_not_before=planned["settle_not_before"],
             )
 
     async def pause(self, a, g, actor):
@@ -575,7 +601,7 @@ class Service:
         finally:
             self.inspections.reset(token)
             self.running.discard(key(a, g, u))
-            if kind == "case" and item["phase"] == "notify" and not self.stopped:
+            if not self.stopped:
                 self.wake.set()
 
     async def tick(self):

@@ -47,6 +47,7 @@ async def test_online_reuse_is_scoped_to_one_attempt_and_unchanged_connection(en
 
 async def test_false_online_result_is_never_cached(env):
     case = await env.speak()
+    env.clock.now = case["notify_not_before"]
     calls = []
 
     async def offline(priority=2):
@@ -281,9 +282,9 @@ async def test_reminder_to_ban_pipeline_is_faster_and_keeps_fresh_member_checks(
     assert trace["outcome"] == "confirmed" and trace["reminder_reference"] == "completed"
     assert 1500 <= trace["since_reminder_ms"] < 11000
     assert trace["configured_delay_ms"] == 1500
-    assert trace["since_reminder_ms"] == pytest.approx(7500 if early else 7910, abs=1)
+    assert trace["since_reminder_ms"] == pytest.approx(6400 if early else 6610, abs=1)
     if early:
-        assert trace["preparation_overlap_ms"] > 1000
+        assert trace["preparation_overlap_ms"] == pytest.approx(200, abs=1)
     assert (after_notify[0]["at"] < trace["write_not_before"]) == early
     assert after_notify[-1]["at"] >= trace["write_not_before"]
     assert trace["details_ms"]["read_wait"] > trace["details_ms"]["api:set_group_ban"]
