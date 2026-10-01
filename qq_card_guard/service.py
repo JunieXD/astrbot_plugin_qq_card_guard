@@ -8,7 +8,7 @@ import time
 from contextvars import ContextVar
 from dataclasses import replace
 
-from .config import GuardError, Later, Policy, Stage, fingerprint
+from .config import CommandPermissionError, GuardError, Later, Policy, Stage, fingerprint
 from .rules import judge, number
 from .scheduling import cache_check
 from .store import key
@@ -345,7 +345,7 @@ class Service:
     async def authorize(self, policy, actor, pid, account):
         adapter = await self.router.resolve(policy, expected=(pid, account), priority=2)
         if not await self.manager(adapter, policy.group_id, actor):
-            raise GuardError("只有该群当前的群主或管理员可以使用此命令。")
+            raise CommandPermissionError("只有该群当前的群主或管理员可以使用此命令。")
         return adapter
 
     async def manager(self, adapter, gid, uid, priority=2):

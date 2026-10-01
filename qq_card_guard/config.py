@@ -12,6 +12,10 @@ class GuardError(Exception):
     """Administrator-safe error text, without transport credentials."""
 
 
+class CommandPermissionError(GuardError):
+    """Unverified command callers must not receive a chat response."""
+
+
 class ApiFailure(GuardError):
     """OneBot returned a failure response; this alone does not imply disconnection."""
 

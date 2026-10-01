@@ -9,6 +9,7 @@ from .rules import matches
 from .store import key
 
 HELP = """QQ 群名片规范（请私聊使用）
+/名片规范 帮助 群号
 /名片规范 状态 群号
 /名片规范 测试 群号 要测试的名片
 /名片规范 检查 群号 QQ号

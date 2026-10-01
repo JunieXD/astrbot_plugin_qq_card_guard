@@ -94,6 +94,7 @@ async def test_private_help_responds_without_network_or_llm(entry):
         message_obj=SimpleNamespace(raw_message={"self_id": "100001"}),
         get_message_str=lambda: "名片规范",
         get_sender_id=lambda: "100003",
+        is_admin=lambda: True,
         platform_meta=SimpleNamespace(id="test-platform"),
     )
     try:
@@ -139,3 +140,92 @@ async def test_log_close_failure_does_not_leak_instance_lock(entry):
     with pytest.raises(OSError):
         await plugin.terminate()
     assert released == [True] and plugin.lock is None
+
+
+
+@pytest.mark.parametrize("admin", [False, True])
+async def test_startup_error_is_visible_only_to_bot_administrators(entry, admin):
+    plugin_cls, _ = entry
+    plugin = plugin_cls(SimpleNamespace(), {})
+    plugin.start_error = "service unavailable"
+    event = SimpleNamespace(stop_event=lambda: None, is_admin=lambda: admin, plain_result=lambda text: text)
+    command = plugin.card_command if hasattr(plugin, "card_command") else plugin.cleaner_command
+    assert [result async for result in command(event)] == (["service unavailable"] if admin else [])
+
+
+@pytest.mark.parametrize("text,allowed,expected", [
+    ("{command}", False, []),
+    ("{command} 帮助", False, []),
+    ("{command} 错误 无效群号", False, []),
+    ("{command} 状态 100002", False, []),
+    ("{command} 帮助 100002", True, ["admin result"]),
+    ("{command} 状态 100002", True, ["admin result"]),
+    ("{command} 错误 100002", True, ["admin result"]),
+])
+async def test_command_entry_authorizes_before_help_or_errors(entry, monkeypatch, text, allowed, expected):
+    plugin_cls, _ = entry
+    module = sys.modules[plugin_cls.__module__]
+    plugin = plugin_cls(SimpleNamespace(), {})
+    name = "名片规范" if hasattr(plugin, "card_command") else "群清理"
+    checks, runs = [], []
+
+    def group(gid):
+        if gid != "100002":
+            raise ValueError("unknown group")
+        return SimpleNamespace(group_id=gid)
+
+    async def authorize(policy, actor, platform, account):
+        checks.append((policy.group_id, actor, platform, account))
+        if not allowed:
+            raise module.CommandPermissionError("not an administrator")
+
+    class Commands:
+        def __init__(self, service):
+            pass
+
+        async def run(self, *args):
+            runs.append(args)
+            return "admin result"
+
+    monkeypatch.setattr(module, "Commands", Commands)
+    plugin.service = SimpleNamespace(
+        jobs=set(), clock=lambda: 100, settings=lambda: SimpleNamespace(group=group),
+        authorize=authorize, journal=SimpleNamespace(record=lambda *a, **kw: None),
+    )
+    event = SimpleNamespace(
+        stop_event=lambda: None, is_admin=lambda: False, plain_result=lambda value: value,
+        message_obj=SimpleNamespace(raw_message={"self_id": "100001"}),
+        get_message_str=lambda: text.format(command=name), get_sender_id=lambda: "100003",
+        platform_meta=SimpleNamespace(id="test-platform"),
+    )
+    command = plugin.card_command if hasattr(plugin, "card_command") else plugin.cleaner_command
+    assert [result async for result in command(event)] == expected
+    assert bool(runs) == bool(expected)
+    assert not plugin.service.jobs
+    if "100002" not in text:
+        assert checks == []
+
+
+async def test_permission_revocation_during_command_is_silent(entry, monkeypatch):
+    plugin_cls, _ = entry
+    module = sys.modules[plugin_cls.__module__]
+    plugin = plugin_cls(SimpleNamespace(), {})
+    async def allowed(*args, **kwargs):
+        return True
+    class Commands:
+        def __init__(self, service):
+            pass
+        async def run(self, *args):
+            raise module.CommandPermissionError("permission was revoked")
+    monkeypatch.setattr(module, "Commands", Commands)
+    plugin.command_access.allowed = allowed
+    plugin.service = SimpleNamespace(jobs=set(), journal=SimpleNamespace(record=lambda *a, **kw: None))
+    event = SimpleNamespace(
+        stop_event=lambda: None, is_admin=lambda: False, plain_result=lambda value: value,
+        message_obj=SimpleNamespace(raw_message={"self_id": "100001"}),
+        get_message_str=lambda: "状态 100002", get_sender_id=lambda: "100003",
+        platform_meta=SimpleNamespace(id="test-platform"),
+    )
+    command = plugin.card_command if hasattr(plugin, "card_command") else plugin.cleaner_command
+    assert [result async for result in command(event)] == []
+    assert not plugin.service.jobs
